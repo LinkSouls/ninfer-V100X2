@@ -4,6 +4,7 @@
 #include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
@@ -11,10 +12,37 @@
 
 namespace ninfer::ops::detail {
 
+// Kept for reference only: no production call site uses it any more (every NVFP4 weight decode
+// entry point now goes through decode_nvfp4_e2m1_byte, or through a kernel that already decodes
+// with integer bit math of its own). It stays so the hardware-backed decode remains available for
+// bit-equivalence checks and for architectures that do have FP4 hardware.
 __device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
     __nv_fp4x2_e2m1 value;
     value.__x = storage;
     return static_cast<float2>(value);
+}
+
+// Volta has no FP4 hardware: __nv_fp4x2_e2m1 decodes through an FP6 path that costs several
+// instructions per value. The E2M1 grid (0, 0.5, 1, 1.5, 2, 3, 4, 6 and their negatives) is
+// exactly representable in FP16, so a nibble decodes with pure integer bit ops that build the
+// FP16 bit pattern directly from sign(1) | exp(2) | mant(1):
+//   exp == 0: subnormal, mant ? 0.5 (0x3800) : 0.0 (0x0000)
+//   exp != 0: (1 + mant/2) * 2^(exp-1) -> 1.0 (0x3C00) with exponent (exp-1) and mantissa mant
+__device__ __forceinline__ std::uint16_t decode_nvfp4_e2m1_nibble(std::uint32_t code) {
+    const std::uint32_t sign = (code >> 3) & 1u;
+    const std::uint32_t exp  = (code >> 1) & 3u;
+    const std::uint32_t mant = code & 1u;
+    const std::uint32_t magnitude =
+        (exp == 0) ? (mant ? 0x3800u : 0x0000u) : (0x3C00u + ((exp - 1) << 10) + (mant << 9));
+    return static_cast<std::uint16_t>(magnitude | (sign << 15));
+}
+
+// Decode one packed byte holding two E2M1 values (low nibble first) to a float2, matching the
+// value order of decode_nvfp4_e2m1x2.
+__device__ __forceinline__ float2 decode_nvfp4_e2m1_byte(std::uint8_t storage) {
+    const __half lo{__half_raw{decode_nvfp4_e2m1_nibble(storage & 0x0Fu)}};
+    const __half hi{__half_raw{decode_nvfp4_e2m1_nibble(storage >> 4)}};
+    return make_float2(__half2float(lo), __half2float(hi));
 }
 
 __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {

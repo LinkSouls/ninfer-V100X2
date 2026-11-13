@@ -186,7 +186,7 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                 const std::uint32_t word  = row_codes[local_row].words[pair / 4];
                 const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                const float2 code         = decode_nvfp4_e2m1x2(packed);
+                const float2 code         = decode_nvfp4_e2m1_byte(packed);
                 const float coefficient   = coefficients[local_row][group];
                 constexpr int kChainMask  = Schedule::kAccumulatorChains - 1;
                 accumulators[local_row][(2 * pair) & kChainMask] =

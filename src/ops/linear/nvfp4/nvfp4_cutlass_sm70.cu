@@ -40,7 +40,7 @@ __global__ void dequant_nvfp4_row_to_fp16(const std::uint8_t* __restrict__ codes
         static_cast<std::int64_t>((row / 128) * scales_per_m128 + scale_tile) * 512 +
         (row_inner & 31) * 16 + (row_inner >> 5) * 4 + scale_lane;
     const float coefficient = decode_nvfp4_e4m3(scales[scale_offset]) * inverse_weight_divisor;
-    const float2 value = decode_nvfp4_e2m1x2(
+    const float2 value = decode_nvfp4_e2m1_byte(
         codes[static_cast<std::int64_t>(row) * bytes_per_row + byte_idx]);
     cutlass::half_t* out_row = out + static_cast<std::int64_t>(row) * k;
     out_row[k0]     = cutlass::half_t(value.x * coefficient);
@@ -70,7 +70,7 @@ __global__ void dequant_nvfp4_qpn_to_fp16(const std::uint8_t* __restrict__ codes
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
         const int position  = inverse_order[j];
-        const float2 pair   = decode_nvfp4_e2m1x2(packed[position / 2]);
+        const float2 pair   = decode_nvfp4_e2m1_byte(packed[position / 2]);
         values[j] = cutlass::half_t(((position & 1) == 0 ? pair.x : pair.y) * coefficient);
     }
     auto* destination = reinterpret_cast<uint4*>(
@@ -208,7 +208,7 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
             cudaStream_t stream) {
     // The same 64x64 warp contraction gains output-column reuse on the wide TP2 MLPs.
     // Narrow calls and other registered geometries retain their measured 128-column tile.
-    if (x.ne[1] >= 2048 && ((w.n == 17408 && w.k == 5120) ||
+    if (x.ne[1] >= 1024 && ((w.n == 17408 && w.k == 5120) ||
                              (w.n == 5120 && w.k == 8704))) {
         launch_impl<ElementOutput, 256>(x, w, out, ws, stream);
     } else {

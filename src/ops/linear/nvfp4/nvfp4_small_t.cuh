@@ -126,7 +126,7 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                     const std::uint32_t word  = row_codes[local_row].words[pair / 4];
                     const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                    const float2 code         = decode_nvfp4_e2m1x2(packed);
+                    const float2 code         = decode_nvfp4_e2m1_byte(packed);
                     const float coefficient   = coefficients[local_row][group];
                     row_weight[local_row] = make_float2(code.x * coefficient, code.y * coefficient);
                 }
@@ -159,7 +159,7 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                     const std::uint32_t word  = row_codes[local_row].words[pair / 4];
                     const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                    const float2 code         = decode_nvfp4_e2m1x2(packed);
+                    const float2 code         = decode_nvfp4_e2m1_byte(packed);
                     const float coefficient   = coefficients[local_row][group];
                     row_weight[local_row] = make_float2(code.x * coefficient, code.y * coefficient);
                 }
