@@ -143,7 +143,7 @@ its session counters reset on start/restart, and incomplete/error requests do no
 `Historical prefix budget` sets `--prefix-cache-tokens` and is saved with preferences.
 The recommended default is **384,000 unique page-rounded Main Text tokens**; `0` keeps
 only current GPU-prefix reuse. Historical Text/None/MTP branches retain exact packed KV and
-complete GDN/tail state in RAM, evicting the oldest saved branch first. QUASAR TP2 INT8 KV
+complete GDN/tail state in RAM, evicting the least recently used saved branch first. QUASAR TP2 INT8 KV
 needs up to about **12.8 GiB RAM** for the 384K default main+MTP tokens (about 33.4 GiB at 1M), plus bounded state images and
 transfer headroom. This is not a process RSS cap. Vision, DFlash and sparse RAM-KV are excluded.
 Long attention admits experimental startup-fixed concurrency **1–8**; all independent requests

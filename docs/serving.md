@@ -827,8 +827,8 @@ The prefix cache is process-local Engine state; restarting the server clears it.
 with complete GPU KV also retains historical branches and multiple conversation trees in host RAM.
 Before an old resident branch is overwritten or its lane evicted, its original Main/MTP KV and
 complete continuation checkpoints can be archived. `--prefix-cache-tokens` defaults to **384000**
-unique page-rounded Main Text tokens, shared across all trees; overflow evicts the oldest archived
-branch first. A historical hit restores private writable GPU pages and exact state, including
+unique page-rounded Main Text tokens, shared across all trees; overflow evicts the least recently
+used archived branch first. A historical hit restores private writable GPU pages and exact state, including
 completed-sibling fan-out. `ABD → ABC → ABDE` can therefore recover ABD. Setting the budget
 to zero keeps current resident reuse but disables historical retention. This is not disk persistence
 or a process RSS cap: QUASAR INT8 Main KV plus MTP can use about **12.8 GiB RAM** at the 384K default

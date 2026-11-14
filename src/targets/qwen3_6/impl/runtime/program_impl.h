@@ -21,6 +21,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <unordered_map>
 #include <utility>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
@@ -257,7 +259,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                           ? std::make_optional<PinnedHostBuffer>(2ULL * plan.prefill_chunk * plan.pipeline_chunks * sizeof(TokenId))
                           : std::nullopt),
       capacity(plan.capacity), kv_capacity(plan.kv_capacity),
-      max_concurrency(plan.max_concurrency), prefix_cache_tokens(plan.prefix_cache_tokens), prefill_chunk(plan.prefill_chunk),
+      max_concurrency(plan.max_concurrency), prefix_cache_tokens(plan.prefix_cache_tokens),
+      prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), ram_kv(plan.ram_kv), volta_long_attention(plan.volta_long_attention),
       speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
@@ -1282,45 +1285,79 @@ namespace {
 std::uint32_t prefix_page_count(std::uint32_t tokens) noexcept {
     return tokens == 0 ? 0 : 1 + (tokens - 1) / kPagedKVPageSize;
 }
+
+// Bytes actually held by one immutable chunk, across every rank and both KV planes.
+std::uint64_t prefix_chunk_bytes(const PrefixKVChunk& chunk) noexcept {
+    std::uint64_t bytes = 0;
+    for (const auto& plane : chunk.text) { bytes += plane.size(); }
+    for (const auto& plane : chunk.backend) { bytes += plane.size(); }
+    return bytes;
+}
 }
 
 void ProgramImplCore::trim_prefix_history() {
-    // Account unique immutable KV chunks, not repeated shared prefixes or TP ranks.
+    // One reference-counting traversal yields both the budget's unique-chunk accounting and each
+    // branch's exclusive bytes: a chunk shared with any other archived branch is not exclusive,
+    // because removing this branch alone would not release it. Lane references are deliberately
+    // excluded -- dropping a branch clears every lane's branch references as well.
     const auto usage = [&] {
-        std::vector<const PrefixKVChunk*> chunks;
-        std::vector<const std::byte*> images;
-        std::uint64_t tokens = 0;
+        std::unordered_map<const PrefixKVChunk*, std::uint32_t> chunk_refs;
+        std::unordered_map<const std::byte*, std::uint32_t> image_refs;
         for (const auto& branch : prefix_history) {
-            for (const auto& chunk : branch->chunks) {
-                if (std::find(chunks.begin(), chunks.end(), chunk.get()) == chunks.end()) {
-                    chunks.push_back(chunk.get());
-                    tokens += std::uint64_t(chunk->pages) * kPagedKVPageSize;
-                }
-            }
-            for (const auto& checkpoint : branch->checkpoints) {
-                if (std::find(images.begin(), images.end(), checkpoint.image.get()) == images.end()) {
-                    images.push_back(checkpoint.image.get());
-                }
+            for (const auto& chunk : branch->chunks) { ++chunk_refs[chunk.get()]; }
+            for (const auto& checkpoint : branch->checkpoints) { ++image_refs[checkpoint.image.get()]; }
+        }
+        std::uint64_t tokens = 0;
+        for (const auto& entry : chunk_refs) {
+            tokens += std::uint64_t(entry.first->pages) * kPagedKVPageSize;
+        }
+        const std::uint64_t state_bytes = std::uint64_t(image_refs.size()) * prefix_checkpoint_bytes();
+        std::vector<std::uint64_t> exclusive(prefix_history.size(), 0);
+        for (std::size_t index = 0; index < prefix_history.size(); ++index) {
+            for (const auto& chunk : prefix_history[index]->chunks) {
+                if (chunk_refs[chunk.get()] == 1) { exclusive[index] += prefix_chunk_bytes(*chunk); }
             }
         }
-        return std::pair(tokens, images.size() * prefix_checkpoint_bytes());
+        return std::tuple{tokens, state_bytes, std::move(exclusive)};
+    };
+    // LRU victim order: branches whose removal releases exclusive memory come first, then the
+    // least recently used, then the larger exclusive footprint. Recency is the primary key -- the
+    // branch sizes are heterogeneous, so ordering by size first would drop hot branches.
+    const auto eviction_rank = [&](std::size_t left, std::size_t right,
+                                   const std::vector<std::uint64_t>& exclusive) {
+        if ((exclusive[left] > 0) != (exclusive[right] > 0)) { return exclusive[left] > 0; }
+        if (prefix_history[left]->last_used_tick != prefix_history[right]->last_used_tick) {
+            return prefix_history[left]->last_used_tick < prefix_history[right]->last_used_tick;
+        }
+        return exclusive[left] > exclusive[right];
     };
     while (!prefix_history.empty()) {
-        const auto [tokens, state_bytes] = usage();
+        auto [tokens, state_bytes, exclusive] = usage();
         if (tokens <= prefix_cache_tokens && state_bytes <= kPrefixCheckpointBudget) { break; }
         if (tokens <= prefix_cache_tokens) {
             // Keep branch endpoints; interior frontiers are expendable under state pressure.
-            bool removed = false;
-            for (auto& branch : prefix_history) {
-                if (branch->checkpoints.size() > 1) {
-                    branch->checkpoints.erase(branch->checkpoints.begin());
-                    removed = true;
-                    break;
+            // LRU drops the interior checkpoint of the least recently used branch that has one.
+            // Branches without interior checkpoints are skipped, never dropped wholesale at this
+            // step.
+            std::size_t donor = prefix_history.size();
+            for (std::size_t index = 0; index < prefix_history.size(); ++index) {
+                if (prefix_history[index]->checkpoints.size() <= 1) { continue; }
+                if (donor == prefix_history.size() ||
+                    prefix_history[index]->last_used_tick <
+                        prefix_history[donor]->last_used_tick) {
+                    donor = index;
                 }
             }
-            if (removed) { continue; }
+            if (donor != prefix_history.size()) {
+                prefix_history[donor]->checkpoints.erase(prefix_history[donor]->checkpoints.begin());
+                continue;
+            }
         }
-        prefix_history.erase(prefix_history.begin()); // FIFO oldest branch, including its private suffix.
+        std::size_t victim = 0;
+        for (std::size_t index = 1; index < prefix_history.size(); ++index) {
+            if (eviction_rank(index, victim, exclusive)) { victim = index; }
+        }
+        prefix_history.erase(prefix_history.begin() + static_cast<std::ptrdiff_t>(victim));
         for (auto& sequence : sequences) {
             sequence.prefix_chunks.clear();
             sequence.shared_prefix_tokens = 0;
@@ -1395,6 +1432,9 @@ void ProgramImplCore::archive_prefix(SequenceState& sequence) {
         archive->chunks.push_back(std::move(chunk));
     }
     prefix_history.push_back(archive);
+    // The recency stamp is NOT bumped here: the stamp marks branches a request plan HIT, and a
+    // branch that was archived but never hit must stay distinguishable from a hit one (tick 0 =
+    // never hit) so the budget overflow drops the idle branches first.
     sequence.archived_snapshot = archive;
     sequence.prefix_chunks = archive->chunks;
     // The final partially valid page must never be shared with a newly written suffix.

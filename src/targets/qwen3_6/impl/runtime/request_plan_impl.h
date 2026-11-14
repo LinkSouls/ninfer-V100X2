@@ -259,8 +259,29 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                     plan->archived_prefix = std::make_shared<ArchivedPrefix>(*archive);
                     plan->reuse = ReusePath::RestorePrefixCheckpoint;
                     plan->reuse_base = checkpoint.frontier;
+                    // Refresh the archived branch itself, not the plan's snapshot copy: only the
+                    // archive's own stamp orders eviction.
+                    touch_archived_prefix(*archive);
                 }
             }
+        }
+    }
+
+    // Resident-lane reuse (AppendAtFrontier or a lane prefix checkpoint) shadows archived branches
+    // that hold the same content, so no plan selects them and their recency stamp would stay at
+    // zero -- indistinguishable from a never-used branch. Backfill the stamp of every archived
+    // branch whose content prefix still matches the prompt up to the reused frontier. This only
+    // reorders eviction; it changes no reuse decision.
+    if (plan->reuse != ReusePath::FullReset && plan->reuse_base != 0) {
+        for (auto& archive : prefix_history) {
+            const bool shadowed = std::any_of(
+                archive->checkpoints.begin(), archive->checkpoints.end(),
+                [&](const auto& checkpoint) {
+                    return checkpoint.frontier <= plan->reuse_base &&
+                           qwen3_6::detail::prefix_matches(prompt, archive->ledger, archive->identity,
+                                                          checkpoint.frontier);
+                });
+            if (shadowed) { touch_archived_prefix(*archive); }
         }
     }
 

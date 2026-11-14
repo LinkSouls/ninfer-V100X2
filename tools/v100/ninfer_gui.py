@@ -291,7 +291,7 @@ class NInferGui(QWidget):
         self.prefix_cache_tokens = self._spin(384000, 0, 100000000, 10000)
         self.prefix_cache_tokens.setToolTip(
             "历史分枝的主机 RAM KV 预算，推荐 384,000 tokens；0 仅保留当前 GPU 前缀。\n"
-            "按唯一 64-token 页计费，共享树干不重复计数，超额淘汰最旧分枝。\n"
+            "按唯一 64-token 页计费，共享树干不重复计数，超额优先淘汰最近最少命中的分枝。\n"
             "27B INT8 主 KV 加 MTP 约 12.8 GiB / 384,000 tokens，另有至多 2 GiB 历史状态。\n"
             "完整 GPU KV 的纯文本 None/MTP 支持；恢复旧枝需 RAM→GPU 传输。")
         self.vision = QCheckBox("开启视觉（图片 / 视频）")

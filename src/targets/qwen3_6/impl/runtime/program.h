@@ -166,6 +166,9 @@ struct ArchivedPrefix {
     qwen3_6::detail::ResidentPrefixIdentity identity;
     std::vector<PrefixCheckpoint> checkpoints;
     std::vector<std::shared_ptr<const PrefixKVChunk>> chunks;
+    // Monotonic stamp of the last plan hit on this branch. Zero means "never hit": such a branch
+    // is the coldest candidate under LRU eviction.
+    std::uint64_t last_used_tick = 0;
 };
 
 struct DecodeGraphProfile {
@@ -418,6 +421,11 @@ public:
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::vector<std::shared_ptr<ArchivedPrefix>> prefix_history;
+    // Monotonic clock for branch recency. Zero is reserved for "never hit", so the counter starts
+    // at 0 and every refresh takes the next value.
+    std::uint64_t prefix_history_tick = 0;
+    // Refreshes the recency stamp of an archived branch itself (not of a plan snapshot copy).
+    void touch_archived_prefix(ArchivedPrefix& archive) { archive.last_used_tick = ++prefix_history_tick; }
     void archive_prefix(SequenceState& sequence);
     void restore_archived_prefix(SequenceState& sequence, const ArchivedPrefix& archive,
                                  const RequestPlanImpl& plan);
