@@ -455,6 +455,45 @@ Retain concise context sufficient to interpret a reported result: relevant hardw
 artifact identity at the descriptive level, workload or command, and summarized measurements. Raw
 reports and fixed repository or artifact hashes are not required by default.
 
+### Dev loop: build and measure through the evidence ladder
+
+A full build of this project is long, and a whole-model measurement round costs seconds per
+request on top of a long weight load. Paying those costs before the cheap checks is what makes a
+small edit expensive. Work the lowest tier that supports the claim and stop there. The dev-loop
+scripts that implement the tiers live outside this repository, in the local `dev-loop` directory,
+because they carry machine-specific paths that do not belong in a shared source tree.
+
+| Tier | What it answers |
+|---|---|
+| T0 | Is the change actually wired in? (static assertions, no GPU time) |
+| T1 | Does the operator still work, and did it get faster at operator scope? |
+| T2 | Is the output numerically unchanged? (token-for-token comparison) |
+| T3 | Does the observable behavior change as intended? (a discriminating load) |
+| T4 | Is the end-to-end performance claim supported? (interleaved A/B) |
+
+Rules that the scripts enforce, because violating them has already produced wrong conclusions on
+this project:
+
+- **A change that adds a helper without switching the call sites is an empty variant.** It builds,
+  it runs, and it measures as "no effect". T0 asserts that the changed symbol is actually called.
+- **Do not compare two variants measured one after the other.** Collect the samples of both
+  variants interleaved within one session; the wall clock drifts enough to invalidate a sequential
+  comparison. If the difference falls inside the repeat-measurement noise band, there is no
+  performance claim to make.
+- **Wait for the previous server to release the cards before starting the next one**, and report
+  which process still holds memory when that wait times out.
+- **A microbenchmark that is bandwidth-bound cannot see an instruction-count win.** Decode-style
+  operator measurements must keep their data in registers; a large random-byte buffer shows no
+  difference even when the register-resident loop is 1.3x faster.
+- **An operator-level result supports an operator-level claim only.** Use T1 to attribute which
+  sub-change contributes what, and T4 to state the end-to-end number.
+
+Build into a single development build tree and never reconfigure it as part of an iteration; the
+compile cache is on, so a rebuild after an unrelated change is cheap. Already-measured results are
+reused rather than re-measured: each variant is archived with a record of its base commit, its
+changes, its build command and its results, and the reuse check compares the archived binaries
+against that record before the numbers are cited again.
+
 ## Tests and verification
 
 Add or retain a test only when it protects supported observable behavior or a realistic regression:
