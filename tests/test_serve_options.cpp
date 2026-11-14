@@ -298,6 +298,16 @@ int main() {
                           ram.ram_kv.budget_bytes == 32000000000ULL,
                       "RAM KV did not separate logical and resident capacity");
     failures += check(defaults.ram_kv.gpu_tokens == 0, "RAM KV unexpectedly enabled by default");
+    // Process hardening is on unless the operator opts out; the flag is what both the
+    // early stderr install and the post-warmup lock read.
+    failures += check(defaults.enable_process_hardening,
+                      "process hardening is not enabled by default");
+    failures += check(!parse({"ninfer-serve", "model.ninfer", "--no-process-hardening"})
+                           .enable_process_hardening,
+                      "--no-process-hardening did not disable process hardening");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--no-process-hardening") != std::string::npos,
+              "serve help omits --no-process-hardening");
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

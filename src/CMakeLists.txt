@@ -381,9 +381,18 @@ if(NINFER_BUILD_PROMPT_INPUT)
 endif()
 
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
+  # Host-side log-path resilience shared by product entry points. Any entry point
+  # that writes diagnostics to stderr can install the non-blocking replacement; the
+  # server is only its first user.
+  add_library(ninfer_product_logging STATIC
+    product/logging/nonblocking_stderr.cpp)
+  ninfer_internal_includes(ninfer_product_logging)
+  target_link_libraries(ninfer_product_logging PUBLIC Threads::Threads)
+
   add_library(ninfer_product_load_progress STATIC
     product/load_progress/load_progress.cpp)
   ninfer_internal_includes(ninfer_product_load_progress)
+  target_link_libraries(ninfer_product_load_progress PRIVATE ninfer_product_logging)
 endif()
 
 # One cold closed registry plus the opaque public product Engine. Family and exact-target
@@ -418,6 +427,7 @@ if(NINFER_BUILD_SERVE)
     serve/tool_call_parser.cpp
     serve/translate.cpp
     serve/console_log.cpp
+    serve/anonymous_residency.cpp
     serve/generation_service.cpp
     serve/request_log.cpp
     serve/http_server.cpp
@@ -428,5 +438,5 @@ if(NINFER_BUILD_SERVE)
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire CUDA::cudart)
+    PRIVATE ninfer_media_acquire CUDA::cudart ninfer_product_logging)
 endif()

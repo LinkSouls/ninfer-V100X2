@@ -1,5 +1,7 @@
 #include "serve/console_log.h"
 
+#include "product/logging/nonblocking_stderr.h"
+
 #include <chrono>
 #include <ctime>
 #include <iomanip>
@@ -51,8 +53,44 @@ std::string current_console_log_prefix(ConsoleLogLevel level) {
 }
 
 void write_console_log(ConsoleLogLevel level, std::string_view message) {
+    // Prefix format, level vocabulary, and the mutex that keeps prefix and message in
+    // one piece are identical in both modes. Only the sink differs: the non-blocking
+    // sink commits the whole line or drops it, so a backed-up downstream can neither
+    // park this thread nor split a line. `message` may itself contain newlines; each
+    // embedded line is prefixed, matching the blocking std::cerr form below.
+    std::string line = current_console_log_prefix(level);
+    line.reserve(line.size() + message.size() + 2);
+
     std::lock_guard lock(console_mutex());
-    std::cerr << current_console_log_prefix(level) << message << '\n';
+    if (product::nonblocking_stderr_enabled()) {
+        const bool single_line = message.find('\n') == std::string_view::npos;
+        if (single_line) {
+            line.append(message);
+            line.push_back('\n');
+            (void)product::write_nonblocking_stderr_line(line);
+            return;
+        }
+        const std::string prefix = line;
+        std::size_t start        = 0;
+        while (start <= message.size()) {
+            const std::size_t newline = message.find('\n', start);
+            const std::string_view segment =
+                newline == std::string_view::npos
+                    ? message.substr(start)
+                    : message.substr(start, newline - start);
+            std::string embedded = prefix;
+            embedded.append(segment);
+            embedded.push_back('\n');
+            (void)product::write_nonblocking_stderr_line(embedded);
+            if (newline == std::string_view::npos) { break; }
+            start = newline + 1;
+        }
+        return;
+    }
+    line.append(message);
+    line.push_back('\n');
+    // Blocking fallback: one insertion, preserving the previous behaviour exactly.
+    std::cerr << line;
 }
 
 } // namespace ninfer::serve

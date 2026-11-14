@@ -318,6 +318,17 @@ ninfer_add_test(ninfer_tool_call_parser_test
 ninfer_add_test(ninfer_serve_options_test
   SOURCES test_serve_options.cpp
   LIBRARIES ninfer_serve)
+# Host-only: no artifact, no device. The non-blocking stderr replacement is driven
+# against a FIFO the test owns, so the whole-line-or-nothing contract and the
+# fallback path are asserted on bytes rather than on a terminal.
+ninfer_add_test(ninfer_nonblocking_stderr_test
+  SOURCES test_nonblocking_stderr.cpp
+  LIBRARIES ninfer_serve ninfer_product_logging)
+# Host-only: no artifact, no device. Selection rules for the post-warmup anonymous
+# page lock, driven with synthetic /proc/self/smaps bodies.
+ninfer_add_test(ninfer_anonymous_residency_test
+  SOURCES test_anonymous_residency.cpp
+  LIBRARIES ninfer_serve)
 # Host-only: no artifact, no device. `--rope native|yarn` parsing on BOTH product front ends plus
 # the effective-context-ceiling resolution and its accept/reject matrix. The CLI parser is
 # compiled in directly because apps/ninfer is an executable, not a library.

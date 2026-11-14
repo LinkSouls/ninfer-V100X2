@@ -22,6 +22,7 @@ container in host RAM. These NInfer control endpoints use the server's configure
 | Method | Path | Behavior |
 | --- | --- | --- |
 | GET | `/ninfer/model` | Return model state, retained bytes, progress and active request count |
+| GET | `/ninfer/hardening` | Return the observed stderr and anonymous-page-lock state, including drop and failure counts |
 | POST | `/ninfer/model/offload` | Copy original container to RAM once, then destroy the GPU Engine |
 | POST | `/ninfer/model/load` | Reconstruct the same configured Engine directly from RAM |
 
@@ -711,6 +712,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--vision-max-tokens N` | merged visual-token limit per prompt and reserved Vision workspace bound, independent of the text context ceiling; `1..32768` | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
+| `--no-process-hardening` | keep stderr blocking and skip post-warmup anonymous-page locking | hardening on |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
@@ -737,6 +739,44 @@ request fields override process flags, and `--greedy` finally forces temperature
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 
+## Process hardening
+
+Two independent mechanisms keep a long-resident server observable and its hot host pages
+resident. Both are on by default, both degrade with a logged reason rather than failing startup,
+and `--no-process-hardening` returns the process to its pre-hardening behaviour.
+
+**Non-blocking stderr.** Early in startup, before any worker thread exists, fd 2 is replaced with
+a non-blocking pipe drained by one forwarding thread that writes the original descriptor. Each
+console line is committed as one `write` of at most `PIPE_BUF` (4096 bytes on Linux); if the whole
+line does not fit, the line is dropped whole and counted. A partial line is never delivered, and
+the writer never waits on the downstream. This matters because every console line is serialized
+through one mutex: a blocked `std::cerr` would park every logging thread, including the request
+path, whenever journald or a log driver applies back-pressure. `std::cerr` itself is routed through
+a line-committing buffer, so a stray `std::cerr << a << b` cannot fragment a line or latch a
+stream failure. If the pipe, the forwarder thread, or the descriptor swap cannot be established,
+the server logs the reason and continues on blocking stderr.
+
+Drops are observable: `/ninfer/hardening` reports `stderr.dropped_lines`, and the `server_start`
+JSONL record carries the same value under `hardening.stderr_dropped_lines` at startup. Console line
+prefixes, level tags and message text are identical in both modes; only the sink differs.
+
+**Anonymous-page locking.** Immediately after `warmup()` the server scans `/proc/self/smaps` and
+`mlock`s eligible anonymous mappings so they cannot be swapped out under host memory pressure.
+Only anonymous, readable-writable mappings between 64 MiB and 2 GiB with at least 64 MiB resident
+are eligible; named mappings (weight mmap, driver shared memory) and the many small transient
+allocations are excluded, so the locked-page limit is not spent on noise. Candidates are locked
+largest-resident first, and the attempt stops at a budget of `min(3/4 x RLIMIT_MEMLOCK, 4 GiB)`,
+keeping a quarter of the hard limit free for other locked allocations. `RLIMIT_MEMLOCK` is charged
+by virtual size, so on a host whose rlimit is smaller than the eligible arena set the largest
+allocation is refused and the rest are skipped: `/ninfer/hardening` reports `locked_regions`,
+`locked_bytes`, `budget_bytes`, `skipped_regions` and `failed_regions`, and the first failure reason
+appears in the startup log and in `hardening.anonymous_lock_note`. Nothing about the lock can fail
+startup, and a host without `CAP_IPC_LOCK` simply locks less.
+
+Locked memory is not reclaimable, so on a host shared with other resident services the 4 GiB
+ceiling and the 3/4 rlimit reserve bound what this process can take. `--no-process-hardening`
+skips both mechanisms: stderr stays blocking and no lock is attempted.
+
 ## Structured request log
 
 `--request-log-jsonl FILE` enables the machine-readable measurement log. The server opens `FILE`
@@ -757,7 +797,7 @@ they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|
-| `server_start` | target/weights identity and artifact, resolved Engine including tensor-parallel width `tp` and the resolved per-rank `devices` list, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
+| `server_start` | target/weights identity and artifact, resolved Engine including tensor-parallel width `tp` and the resolved per-rank `devices` list, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, observed process-hardening state, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |

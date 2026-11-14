@@ -5,6 +5,7 @@
 // streaming callbacks, and tool-call parsing) outside the target package.
 
 #include "ninfer/engine.h"
+#include "serve/anonymous_residency.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
@@ -13,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -95,6 +97,30 @@ struct ModelResidency {
     std::size_t active_requests = 0;
 };
 
+// What process-level hardening is actually in force, as opposed to what the command
+// line asked for. Every field is observed at the point the effect exists: the stderr
+// mode is read from the installed replacement, the lock figures from the warmup-time
+// attempt, so a failed or skipped step is never reported as enabled.
+struct ProcessHardeningSummary {
+    // Command-line request (`--no-process-hardening` clears both).
+    bool requested = true;
+    // stderr is a non-blocking pipe with the line-committing sink installed.
+    bool nonblocking_stderr = false;
+    // Why it is not installed, when the request was made and the install failed.
+    std::string stderr_fallback_reason;
+    std::uint64_t stderr_dropped_lines  = 0;
+    std::uint64_t stderr_forwarded_bytes = 0;
+    std::uint32_t stderr_pipe_bytes      = 0;
+    // Anonymous-page locking, executed once after warmup().
+    bool anonymous_lock_attempted      = false;
+    std::size_t anonymous_locked_regions = 0;
+    std::uint64_t anonymous_locked_bytes = 0;
+    std::uint64_t anonymous_lock_budget_bytes = 0;
+    std::size_t anonymous_skipped_regions     = 0;
+    std::size_t anonymous_failed_regions      = 0;
+    std::string anonymous_lock_note; // first failure or scan error, empty on success
+};
+
 class GenerationService {
 public:
     explicit GenerationService(ServeOptions options, LoadProgress load_progress = {});
@@ -128,6 +154,15 @@ public:
 
     void warmup();
 
+    // Locks the eligible anonymous mappings of this process. Must be called after
+    // warmup(), when the host arenas are allocated and touched. Never throws; the
+    // result is kept for process_hardening_summary().
+    void lock_anonymous_pages();
+
+    // Observed process hardening state. The single place that answers "what is
+    // actually in force", so logging never has to infer it from ServeOptions alone.
+    [[nodiscard]] ProcessHardeningSummary process_hardening_summary() const;
+
 private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
 
@@ -141,6 +176,10 @@ private:
     ninfer::ModelMemory host_model_;
     ModelResidency residency_;
     ninfer::RuntimeStats completed_stats_;
+    // The lock report is written once by the post-warmup pass; the mutex is mutable so
+    // the read-side accessor stays const.
+    mutable std::mutex anonymous_lock_mutex_;
+    AnonymousPageLockReport anonymous_lock_;
     void update_load_progress(std::string_view phase, std::uint64_t done, std::uint64_t total);
 };
 

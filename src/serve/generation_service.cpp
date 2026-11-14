@@ -1,6 +1,7 @@
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
+#include "product/logging/nonblocking_stderr.h"
 #include "serve/console_log.h"
 #include "serve/tool_call_parser.h"
 #include "serve/translate.h"
@@ -582,6 +583,52 @@ void GenerationService::warmup() {
         write_console_log(ConsoleLogLevel::Warning,
                           std::string("warmup failed (continuing): ") + exception.what());
     }
+
+    // The lock pass is not run here: the caller invokes lock_anonymous_pages()
+    // immediately after this returns, so the attempt is observable in the startup
+    // sequence and its failure cannot be confused with a warmup failure.
+}
+
+void GenerationService::lock_anonymous_pages() {
+    // Gate and report from one place: with hardening disabled nothing is scanned, so
+    // no startup line suggests an attempt that never happened.
+    if (!options_.enable_process_hardening) { return; }
+    const AnonymousPageLockReport report = serve::lock_anonymous_pages(AnonymousPageLockPolicy{});
+    // A failing lock must be visible but must not stop startup: report, then serve.
+    const std::string line = format_anonymous_page_lock_report(report);
+    {
+        std::lock_guard lock(anonymous_lock_mutex_);
+        anonymous_lock_ = report;
+    }
+    write_console_log(ConsoleLogLevel::Info, line);
+}
+
+ProcessHardeningSummary GenerationService::process_hardening_summary() const {
+    ProcessHardeningSummary summary;
+    summary.requested = options_.enable_process_hardening;
+
+    summary.nonblocking_stderr = product::nonblocking_stderr_enabled();
+    if (!summary.nonblocking_stderr) {
+        summary.stderr_fallback_reason = product::nonblocking_stderr_last_error();
+    }
+    summary.stderr_dropped_lines   = product::nonblocking_stderr_dropped_lines();
+    summary.stderr_forwarded_bytes = product::nonblocking_stderr_forwarded_bytes();
+    summary.stderr_pipe_bytes =
+        static_cast<std::uint32_t>(product::nonblocking_stderr_pipe_capacity_bytes());
+
+    std::lock_guard lock(anonymous_lock_mutex_);
+    summary.anonymous_lock_attempted        = anonymous_lock_.attempted();
+    summary.anonymous_locked_regions        = anonymous_lock_.locked_regions;
+    summary.anonymous_locked_bytes          = anonymous_lock_.locked_bytes;
+    summary.anonymous_lock_budget_bytes     = anonymous_lock_.budget_bytes;
+    summary.anonymous_skipped_regions       = anonymous_lock_.skipped_regions;
+    summary.anonymous_failed_regions        = anonymous_lock_.failed_regions;
+    if (!anonymous_lock_.failures.empty()) {
+        summary.anonymous_lock_note = anonymous_lock_.failures.front();
+    } else {
+        summary.anonymous_lock_note = anonymous_lock_.scan_error;
+    }
+    return summary;
 }
 
 } // namespace ninfer::serve

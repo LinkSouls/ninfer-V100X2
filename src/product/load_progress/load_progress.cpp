@@ -1,5 +1,7 @@
 #include "product/load_progress/load_progress.h"
 
+#include "product/logging/nonblocking_stderr.h"
+
 #include <unistd.h>
 
 #include <algorithm>
@@ -60,7 +62,14 @@ std::string format_line(std::string_view phase, std::uint64_t done, std::uint64_
 } // namespace
 
 LoadProgressRendererOptions stderr_load_progress_options() noexcept {
-    if (::isatty(STDERR_FILENO) == 1) {
+    // After a non-blocking stderr replacement fd 2 is a pipe, but the *operator's*
+    // terminal is still the terminal that was replaced. Deciding from the pipe would
+    // silently downgrade interactive progress to log mode, so ask the replacement.
+    const bool interactive =
+        product::nonblocking_stderr_enabled()
+            ? product::nonblocking_stderr_original_is_tty()
+            : (::isatty(STDERR_FILENO) == 1);
+    if (interactive) {
         return LoadProgressRendererOptions{
             .mode                 = LoadProgressOutputMode::Interactive,
             .min_refresh_interval = std::chrono::milliseconds(200),

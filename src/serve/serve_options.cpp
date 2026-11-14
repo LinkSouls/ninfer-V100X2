@@ -125,7 +125,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--ram-kv-window N] [--ram-kv-budget-bytes N] "
            "[--default-max-tokens N] [--max-output-tokens N] "
            "[--vision] [--vision-device gpu|cpu] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
-           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
+           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] [--no-process-hardening] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
@@ -155,6 +155,9 @@ std::string serve_usage_text(const char* argv0) {
            " MiB of sizing headroom\n"
            "       --prefix-cache-tokens N: historical host KV budget, default 384000; 0 disables history.\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default).\n"
+           "       --no-process-hardening keeps stderr blocking and skips post-warmup anonymous-page\n"
+           "       locking; both are enabled by default and degrade individually with a logged\n"
+           "       reason rather than failing startup.\n"
            "       Prefix reuse supports parallel Text/MTP, including exact prompt hits.\n"
            "       Text/None/MTP also restores RAM state checkpoints within a shared prefix\n"
            "       (up to 2 GiB active state RAM); historical branches also retain exact host KV\n"
@@ -366,6 +369,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--no-process-hardening") {
+            options.enable_process_hardening = false;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {

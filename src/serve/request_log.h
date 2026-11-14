@@ -7,7 +7,6 @@
 #include "serve/generation_service.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
-
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -113,7 +112,8 @@ std::string format_server_start_json(const std::string& server_instance_id,
                                      const ninfer::LoadSummary& load,
                                      const ninfer::MemorySummary& memory,
                                      const ServerLogEnvironment& environment,
-                                     std::optional<std::uint64_t> artifact_size_bytes);
+                                     std::optional<std::uint64_t> artifact_size_bytes,
+                                     const ProcessHardeningSummary& hardening = {});
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context);
@@ -151,7 +151,8 @@ public:
     void write_server_start(const ServeOptions& options,
                             const ninfer::ModelSamplingDefaults& sampling_defaults,
                             const std::string& public_model_id, const ninfer::LoadSummary& load,
-                            const ninfer::MemorySummary& memory);
+                            const ninfer::MemorySummary& memory,
+                            const ProcessHardeningSummary& hardening = {});
     void write_request_start(const RequestLogContext& context);
     void write_request_rejected(const RequestRejectionLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);

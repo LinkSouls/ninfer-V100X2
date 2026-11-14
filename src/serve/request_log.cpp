@@ -448,7 +448,8 @@ std::string format_server_start_json(
     const std::string& server_instance_id, std::uint64_t timestamp, const ServeOptions& options,
     const ninfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
     const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
-    const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes) {
+    const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes,
+    const ProcessHardeningSummary& hardening) {
     Json record = event_base(server_instance_id, timestamp, "server_start");
 
     Json artifact_size = nullptr;
@@ -520,6 +521,28 @@ std::string format_server_start_json(
           {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
           {"speculative_draft_window", options.speculative.draft_tokens},
           {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};
+    // Process hardening is reported as observed, not as requested: `enabled` is the
+    // command-line setting while the other fields say what actually took effect, so a
+    // failed install or a rlimit refusal is visible in the record instead of inferred
+    // from a missing log file.
+    Json hardening_json{
+        {"enabled", hardening.requested},
+        {"stderr_nonblocking", hardening.nonblocking_stderr},
+        {"stderr_pipe_bytes", hardening.stderr_pipe_bytes},
+        {"stderr_dropped_lines", hardening.stderr_dropped_lines},
+        {"anonymous_lock_attempted", hardening.anonymous_lock_attempted},
+        {"anonymous_locked_regions", hardening.anonymous_locked_regions},
+        {"anonymous_locked_bytes", hardening.anonymous_locked_bytes},
+        {"anonymous_lock_budget_bytes", hardening.anonymous_lock_budget_bytes},
+        {"anonymous_skipped_regions", hardening.anonymous_skipped_regions},
+        {"anonymous_failed_regions", hardening.anonymous_failed_regions}};
+    if (!hardening.stderr_fallback_reason.empty()) {
+        hardening_json["stderr_fallback_reason"] = hardening.stderr_fallback_reason;
+    }
+    if (!hardening.anonymous_lock_note.empty()) {
+        hardening_json["anonymous_lock_note"] = hardening.anonymous_lock_note;
+    }
+    record["hardening"] = std::move(hardening_json);
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},
@@ -687,7 +710,8 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
                                          const ninfer::ModelSamplingDefaults& sampling_defaults,
                                          const std::string& public_model_id,
                                          const ninfer::LoadSummary& load,
-                                         const ninfer::MemorySummary& memory) {
+                                         const ninfer::MemorySummary& memory,
+                                         const ProcessHardeningSummary& hardening) {
     if (!enabled()) { return; }
     std::error_code error;
     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, error);
@@ -695,7 +719,8 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
         error ? std::nullopt : std::optional<std::uint64_t>(size);
     append(format_server_start_json(server_instance_id_, unix_time_ms(), options, sampling_defaults,
                                     public_model_id, load, memory,
-                                    query_server_log_environment(options.device), artifact_size));
+                                    query_server_log_environment(options.device), artifact_size,
+                                    hardening));
 }
 
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {

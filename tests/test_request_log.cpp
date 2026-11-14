@@ -217,6 +217,51 @@ int main() {
                       "server JSON leaked the API key");
     failures += check(server.at("argv").at(3) == "<redacted>",
                       "server argv did not retain the redaction marker");
+    // Hardening is recorded as observed state, so the record can explain a fallback
+    // instead of leaving a reader to infer it from a missing log line.
+    failures += check(server.at("hardening").at("enabled") == true &&
+                          server.at("hardening").at("stderr_nonblocking") == false,
+                      "hardening defaults are not recorded as requested-but-observe");
+    failures += check(server.at("hardening").at("anonymous_lock_attempted") == false &&
+                          server.at("hardening").at("anonymous_locked_regions") == 0,
+                      "a lock that never ran is recorded as if it had");
+    {
+        ProcessHardeningSummary observed;
+        observed.requested                = true;
+        observed.nonblocking_stderr       = true;
+        observed.stderr_pipe_bytes        = 1 << 20;
+        observed.stderr_dropped_lines     = 17;
+        observed.stderr_forwarded_bytes   = 4096;
+        observed.anonymous_lock_attempted = true;
+        observed.anonymous_locked_regions = 2;
+        observed.anonymous_locked_bytes   = 512ULL << 20;
+        observed.anonymous_lock_budget_bytes    = 3ULL << 30;
+        observed.anonymous_skipped_regions      = 4;
+        observed.anonymous_failed_regions       = 1;
+        observed.anonymous_lock_note            = "mlock failed: Cannot allocate memory";
+        const Json with_hardening = Json::parse(format_server_start_json(
+            "serve-test", 1000, options, sampling_defaults, "deployment-alias", load, memory,
+            environment, std::uint64_t{123456}, observed));
+        failures += check(with_hardening.at("hardening").at("stderr_nonblocking") == true &&
+                              with_hardening.at("hardening").at("stderr_dropped_lines") == 17,
+                          "observed stderr state missing from the server record");
+        failures += check(with_hardening.at("hardening").at("anonymous_locked_bytes") ==
+                              (512ULL << 20) &&
+                              with_hardening.at("hardening").at("anonymous_failed_regions") == 1,
+                          "observed lock outcome missing from the server record");
+        failures += check(with_hardening.at("hardening").at("anonymous_lock_note") ==
+                              "mlock failed: Cannot allocate memory",
+                          "lock failure reason missing from the server record");
+        ProcessHardeningSummary fallback;
+        fallback.requested              = true;
+        fallback.stderr_fallback_reason = "pipe2 failed: Too many open files";
+        const Json fell_back = Json::parse(format_server_start_json(
+            "serve-test", 1000, options, sampling_defaults, "deployment-alias", load, memory,
+            environment, std::uint64_t{123456}, fallback));
+        failures += check(fell_back.at("hardening").at("stderr_fallback_reason") ==
+                              "pipe2 failed: Too many open files",
+                          "stderr fallback reason missing from the server record");
+    }
 
     GenerationRequest request;
     request.model          = "qwen3.6-27b";

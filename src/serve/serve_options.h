@@ -64,6 +64,10 @@ struct ServeOptions {
     std::uint32_t vision_max_tokens = kMaximumVisionTokenBudget;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
+    // Process-level hardening: non-blocking stderr in early startup, and anonymous
+    // arenas mlocked after warmup. `--no-process-hardening` clears both for
+    // deployments that cannot spare the memory or the locked-page rlimit.
+    bool enable_process_hardening = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;

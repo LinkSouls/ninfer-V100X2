@@ -276,6 +276,32 @@ void HttpServer::register_routes() {
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
+    // The drop counter must be queryable, not only inferable: a stalled downstream
+    // silently removes diagnostics, and an operator needs to know that happened.
+    // `/health` stays a pure liveness probe; the hardening state is its own endpoint
+    // alongside the existing `/ninfer/model` residency endpoint.
+    server_.Get("/ninfer/hardening", [this](const httplib::Request&, httplib::Response& res) {
+        const ProcessHardeningSummary summary = service_->process_hardening_summary();
+        nlohmann::json body{
+            {"enabled", summary.requested},
+            {"stderr", {{"nonblocking", summary.nonblocking_stderr},
+                        {"pipe_bytes", summary.stderr_pipe_bytes},
+                        {"dropped_lines", summary.stderr_dropped_lines},
+                        {"forwarded_bytes", summary.stderr_forwarded_bytes}}},
+            {"anonymous_lock", {{"attempted", summary.anonymous_lock_attempted},
+                                {"locked_regions", summary.anonymous_locked_regions},
+                                {"locked_bytes", summary.anonymous_locked_bytes},
+                                {"budget_bytes", summary.anonymous_lock_budget_bytes},
+                                {"skipped_regions", summary.anonymous_skipped_regions},
+                                {"failed_regions", summary.anonymous_failed_regions}}}};
+        if (!summary.stderr_fallback_reason.empty()) {
+            body["stderr"]["fallback_reason"] = summary.stderr_fallback_reason;
+        }
+        if (!summary.anonymous_lock_note.empty()) {
+            body["anonymous_lock"]["note"] = summary.anonymous_lock_note;
+        }
+        res.set_content(body.dump(), "application/json");
+    });
     const auto residency_response = [this](httplib::Response& res) {
         const auto state = service_->model_residency();
         res.set_content(nlohmann::json{
@@ -796,7 +822,8 @@ void HttpServer::attach(GenerationService& service) {
     public_model_id_               = resolve_public_model_id(options_, load.model_id);
     service_                       = &service;
     request_jsonl_.write_server_start(options_, service.sampling_defaults(), public_model_id_, load,
-                                      service.memory_summary());
+                                      service.memory_summary(),
+                                      service.process_hardening_summary());
 }
 
 bool HttpServer::listen() {

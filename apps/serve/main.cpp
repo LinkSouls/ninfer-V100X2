@@ -1,4 +1,5 @@
 #include "product/load_progress/load_progress.h"
+#include "product/logging/nonblocking_stderr.h"
 #include "serve/console_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
@@ -44,6 +45,19 @@ int main(int argc, char** argv) {
         if (options.help_requested) {
             std::cout << ninfer::serve::serve_usage_text(argv[0]);
             return 0;
+        }
+
+        // p2 serve-process-resilience: install the non-blocking stderr replacement before any
+        // worker thread exists. A failure is recorded, never fatal: stderr stays blocking and the
+        // server runs with its pre-hardening behaviour.
+        if (options.enable_process_hardening) {
+            const std::string stderr_install_error = ninfer::product::enable_nonblocking_stderr();
+            if (!stderr_install_error.empty()) {
+                ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Warning,
+                                                "nonblocking stderr unavailable "
+                                                "(continuing with blocking stderr): " +
+                                                    stderr_install_error);
+            }
         }
 
         using Clock = std::chrono::steady_clock;
@@ -101,6 +115,10 @@ int main(int argc, char** argv) {
 
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "warming up...");
         service.warmup();
+        // Anonymous arenas are only fully allocated and touched once warmup has run,
+        // so the lock attempt belongs here and not earlier. The service gates the
+        // policy itself, so the call site stays unconditional.
+        service.lock_anonymous_pages();
 
         g_server.store(&server);
         std::signal(SIGINT, handle_signal);

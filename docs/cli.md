@@ -362,3 +362,16 @@ default of 30 seconds still covers preparation and can expire during CPU encodin
 `--volta-long-attention` can be combined with GPU or CPU Vision on SM70 27B TP2/PP1, complete
 INT8 group-64 KV, None/MTP and experimental concurrency 1–8. It remains default-off and changes
 floating-point association. `--volta-fast-decode` remains incompatible with Vision.
+
+## Process hardening
+
+`apps/ninfer` runs one request and exits, so it does **not** install the server's process-level
+hardening: its stderr stays blocking and it never locks anonymous pages. Those two mechanisms
+address a long-resident process whose diagnostics can stall behind a log driver and whose host
+arenas can be swapped out between requests, and they belong to `apps/ninfer-serve`. See
+[HTTP serving](serving.md#process-hardening) for the `--no-process-hardening` option, the
+whole-line-or-dropped stderr contract and its drop counter, and the measured size band and budget
+that bound anonymous-page locking.
+
+The same rule explains why the CLI is the safer place to reproduce a diagnosis: a blocker on
+stderr that would be dropped by the server is still delivered here in full.
