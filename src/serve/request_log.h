@@ -37,6 +37,9 @@ struct RequestLogContext {
     std::size_t tool_count                  = 0;
     ToolChoice tool_choice;
     bool has_tool_history                  = false;
+    // Number of Anthropic `tool_reference` blocks degraded to empty tool results. Zero means
+    // the client did not use a deferred-tool path; the JSON field is omitted in that case.
+    std::size_t tool_reference_count        = 0;
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;

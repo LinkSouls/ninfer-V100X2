@@ -606,6 +606,34 @@ an effort with `thinking.type: "disabled"` is rejected as contradictory.
 
 Anthropic's `model` field is treated as a response label and does not select the loaded artifact.
 
+### `tool_reference` blocks in tool results
+
+Clients that defer tool loading (Claude Code's Tool Search) may return a `tool_reference` block
+inside a `tool_result`'s `content` array:
+
+```json
+{"type": "tool_result", "tool_use_id": "toolu_01", "content": [{"type": "tool_reference", "tool_name": "WebSearch"}]}
+```
+
+NInfer accepts this block instead of rejecting the request. A `tool_reference` carries only
+`tool_name` -- the client's "this tool's schema is loaded" signal -- and no text that could be
+fed back to the model, so it is degraded to an **empty tool result**: the tool turn still exists
+and still carries its `tool_use_id`, and the rendered prompt is byte-identical to the one the
+client would have produced by returning an empty string. No extra model-visible token is
+introduced, and the `tool_use`/`tool_result` pairing is preserved.
+
+When a `tool_result` mixes `text` and `tool_reference` blocks, only the text reaches the model
+context; the placeholder is ignored.
+
+The degradation is observable: the request log carries a `tool_reference_count` field with the
+number of degraded blocks, and the console request line appends `tool_reference=N`. The field is
+omitted when the count is zero, so a non-zero value means the client used a deferred-tool path.
+
+This relaxation is scoped to `tool_reference` inside `tool_result.content`. Every other unknown
+block type is still rejected with HTTP 400 -- unknown top-level user content blocks, unknown
+assistant content blocks, and unknown `tool_result` content blocks all keep their previous
+strict-rejection behavior. The protocol layer has not been loosened globally.
+
 Messages usage reports `cache_read_input_tokens` for actual prefix-cache reuse and `input_tokens`
 for the remaining uncached input. Their sum is the complete templated input-token count.
 `cache_creation_input_tokens` is zero: NInfer does not expose a separate cache-creation accounting

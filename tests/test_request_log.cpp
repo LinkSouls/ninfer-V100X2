@@ -266,6 +266,20 @@ int main() {
                           started.at("preparation_seconds").at("tokenize") == 0.02 &&
                           started.at("preparation_seconds").at("cache_misses") == 1,
                       "request-scoped media preparation diagnostics missing");
+    // A request without degraded tool_reference blocks keeps the field out of the log entirely.
+    failures += check(!started.at("request").contains("tool_reference_count"),
+                      "tool_reference_count appeared for a request without tool_reference blocks");
+
+    GenerationRequest referenced_request = request;
+    referenced_request.tool_reference_count = 3;
+    const RequestLogContext referenced_context =
+        make_request_log_context(9, "anthropic_messages", referenced_request, prepared);
+    const Json referenced = Json::parse(format_request_start_json("serve-test", 2600, referenced_context));
+    failures += check(referenced.at("request").at("tool_reference_count") == 3,
+                      "tool_reference_count missing from the request log");
+    failures += check(format_request_start(referenced_context).find("tool_reference=3") !=
+                          std::string::npos,
+                      "console request line did not report the degraded tool_reference count");
 
     ApiError preparation_error;
     preparation_error.status = 400;

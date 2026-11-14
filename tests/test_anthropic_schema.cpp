@@ -10,19 +10,26 @@
 #include "serve/request.h"
 #include "serve/translate.h"
 
+#include "targets/qwen3_6/impl/frontend/chat_template.h"
+
 #include <nlohmann/json.hpp>
 
 #include <array>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
 using Json = nlohmann::json;
 using namespace ninfer::serve;
+namespace fi = ninfer::targets::qwen3_6::frontend_internal;
 
 int fail(const std::string& message) {
     std::cerr << "FAIL: " << message << '\n';
@@ -88,6 +95,62 @@ std::string joined_text(const ninfer::ChatMessage& message) {
         if (part.kind == ninfer::MessagePartKind::Text) { text += part.text; }
     }
     return text;
+}
+
+// Render a translated prompt with the shipped Qwen3.6 chat template so a test can compare
+// the exact model-visible bytes of two requests (e.g. an empty tool result and one degraded
+// from a `tool_reference` block). The template is selected by content digest, so the fixture
+// must be byte-identical to the one the frontend accepts.
+std::string render_prompt(const ninfer::PromptInput& input) {
+    static const std::string template_source = [] {
+        std::ifstream stream(std::string(NINFER_SOURCE_DIR) +
+                             "/tests/fixtures/frontend/thinking_toggle_chat_template.jinja");
+        std::ostringstream buffer;
+        buffer << stream.rdbuf();
+        std::string source = buffer.str();
+        if (!source.empty() && source.back() == '\n') { source.pop_back(); }
+        return source;
+    }();
+    static const fi::CompiledChatTemplate chat_template =
+        fi::CompiledChatTemplate::resolve(template_source);
+
+    std::vector<fi::ChatMessage> messages;
+    messages.reserve(input.messages.size());
+    for (const ninfer::ChatMessage& source : input.messages) {
+        fi::ChatMessage message;
+        message.role              = source.role;
+        message.reasoning_content = source.reasoning_content;
+        message.tool_call_id      = source.tool_call_id;
+        for (const ninfer::ToolCall& call : source.tool_calls) {
+            message.tool_calls.push_back(
+                fi::ToolCall{.id             = call.id,
+                             .name           = call.name,
+                             .arguments_json = call.arguments_json});
+        }
+        for (const ninfer::MessagePart& part : source.parts) {
+            if (part.kind == ninfer::MessagePartKind::Text) {
+                message.parts.push_back(fi::ChatPart::text_part(part.text));
+                continue;
+            }
+            fi::MediaData media;
+            media.source_name = part.media.source_name;
+            media.media_type  = part.media.media_type;
+            media.bytes       = part.media.bytes;
+            message.parts.push_back(part.media.kind == ninfer::MediaKind::Image
+                                        ? fi::ChatPart::image(std::move(media))
+                                        : fi::ChatPart::video(std::move(media)));
+        }
+        messages.push_back(std::move(message));
+    }
+
+    fi::ChatRenderOptions options;
+    options.add_generation_prompt = input.options.add_generation_prompt;
+    options.enable_thinking       = input.options.enable_thinking;
+    options.reasoning_effort      = input.options.reasoning_effort;
+    options.preserve_thinking     = input.options.preserve_thinking;
+    options.add_vision_id         = input.options.add_vision_id;
+    options.tool_jsons            = input.options.tool_jsons;
+    return chat_template.render(messages, std::move(options)).text;
 }
 
 // Parse an Anthropic SSE event ("event: <type>\ndata: <json>\n\n") into its JSON
@@ -470,6 +533,133 @@ int test_tool_use_result_roundtrip() {
     return failures;
 }
 
+// Anthropic clients that defer tool loading (Claude Code's Tool Search) return a
+// `tool_reference` block inside `tool_result.content`. It must be accepted, must not
+// contribute any model-visible text, and must not break the turn structure.
+int test_tool_reference_degradation() {
+    int failures = 0;
+
+    const Json tool_use = Json{{"role", "assistant"},
+                               {"content", Json::array({Json{{"type", "tool_use"},
+                                                            {"id", "toolu_1"},
+                                                            {"name", "WebSearch"},
+                                                            {"input", Json::object()}}})}};
+    const Json tool_reference_result =
+        Json{{"role", "user"},
+             {"content", Json::array({Json{{"type", "tool_result"},
+                                          {"tool_use_id", "toolu_1"},
+                                          {"content", Json::array({Json{{"type", "tool_reference"},
+                                                                       {"tool_name", "WebSearch"}}})}}})}};
+    const Json body = {{"model", "m"},
+                       {"max_tokens", 8},
+                       {"messages", Json::array({Json{{"role", "user"}, {"content", "search please"}},
+                                                 tool_use, tool_reference_result})}};
+
+    const GenerationRequest req = parse_messages_request(body, default_limits());
+    // The turn structure survives: user, assistant, tool.
+    failures += check(req.messages.size() == 3, "tool_reference request kept its turn count");
+    failures += check(req.messages[2].role == ninfer::ChatRole::Tool,
+                      "tool_reference result still expanded into a tool turn");
+    failures += check(req.messages[2].tool_call_id == "toolu_1",
+                      "tool_reference result kept its tool_use_id");
+    failures += check(req.messages[2].content.size() == 1 &&
+                          req.messages[2].content[0].kind == ContentKind::Text &&
+                          req.messages[2].content[0].text.empty(),
+                      "tool_reference produced no tool content");
+    failures += check(req.has_tool_history(), "tool_reference request still has tool history");
+    failures += check(req.tool_reference_count == 1, "tool_reference counted once");
+
+    // The degraded result must render byte-identically to a client that returned an empty
+    // string for the same tool_use_id.
+    const Json empty_result = Json{{"role", "user"},
+                                   {"content", Json::array({Json{{"type", "tool_result"},
+                                                                {"tool_use_id", "toolu_1"},
+                                                                {"content", ""}}})}};
+    const Json empty_body = {{"model", "m"},
+                             {"max_tokens", 8},
+                             {"messages", Json::array({Json{{"role", "user"}, {"content", "search please"}},
+                                                       tool_use, empty_result})}};
+    const GenerationRequest empty_req = parse_messages_request(empty_body, default_limits());
+    failures += check(empty_req.tool_reference_count == 0, "no tool_reference counted for empty text");
+    failures += check(render_prompt(translate(req)) == render_prompt(translate(empty_req)),
+                      "tool_reference changed the model-visible prompt");
+
+    // Mixed content: the text survives, the placeholder is ignored.
+    const Json mixed_result =
+        Json{{"role", "user"},
+             {"content", Json::array({Json{{"type", "tool_result"},
+                                          {"tool_use_id", "toolu_1"},
+                                          {"content", Json::array({Json{{"type", "text"},
+                                                                        {"text", "result text"}},
+                                                                       Json{{"type", "tool_reference"},
+                                                                            {"tool_name", "WebSearch"}}})}}})}};
+    const Json mixed_body = {{"model", "m"},
+                             {"max_tokens", 8},
+                             {"messages", Json::array({Json{{"role", "user"}, {"content", "search please"}},
+                                                       tool_use, mixed_result})}};
+    const GenerationRequest mixed_req = parse_messages_request(mixed_body, default_limits());
+    failures += check(mixed_req.messages[2].content.size() == 1 &&
+                          mixed_req.messages[2].content[0].text == "result text",
+                      "mixed tool_result lost its text next to a tool_reference");
+    failures += check(mixed_req.tool_reference_count == 1, "mixed tool_reference counted once");
+
+    // A tool result between two user messages keeps the user-tool-user order.
+    const Json ordered_tool_result =
+        Json{{"type", "tool_result"},
+             {"tool_use_id", "toolu_1"},
+             {"content", Json::array({Json{{"type", "tool_reference"}, {"tool_name", "WebSearch"}}})}};
+    const Json ordered_middle = Json{{"role", "user"}, {"content", Json::array({ordered_tool_result})}};
+    const Json ordered_last   = Json{{"role", "user"}, {"content", "second"}};
+    const Json ordered_body   = {{"model", "m"},
+                                 {"max_tokens", 8},
+                                 {"messages", Json::array({Json{{"role", "user"}, {"content", "first"}},
+                                                           ordered_middle, ordered_last})}};
+    const GenerationRequest ordered_req = parse_messages_request(ordered_body, default_limits());
+    failures += check(ordered_req.messages.size() == 3 && //
+                          ordered_req.messages[0].role == ninfer::ChatRole::User &&
+                          ordered_req.messages[1].role == ninfer::ChatRole::Tool &&
+                          ordered_req.messages[2].role == ninfer::ChatRole::User &&
+                          ordered_req.messages[2].content[0].text == "second",
+                      "tool_reference did not preserve the user-tool-user order");
+
+    // Unknown tool_result block types are still rejected.
+    const Json unknown_result =
+        Json{{"role", "user"},
+             {"content", Json::array({Json{{"type", "tool_result"},
+                                          {"tool_use_id", "toolu_1"},
+                                          {"content", Json::array({Json{{"type", "mystery_block"}}})}}})}};
+    const Json unknown_body = {{"model", "m"},
+                               {"max_tokens", 8},
+                               {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}},
+                                                         unknown_result})}};
+    failures += check(throws_api([&] {
+                          (void)parse_messages_request(unknown_body, default_limits());
+                      }),
+                      "unknown tool_result block type was accepted");
+
+    // Unknown top-level user and assistant block types are still rejected.
+    const Json unknown_user = {{"model", "m"},
+                               {"max_tokens", 8},
+                               {"messages", Json::array({Json{
+                                    {"role", "user"},
+                                    {"content", Json::array({Json{{"type", "mystery_block"}}})}}})}};
+    failures += check(throws_api([&] {
+                          (void)parse_messages_request(unknown_user, default_limits());
+                      }),
+                      "unknown user content block was accepted");
+
+    const Json unknown_assistant = {{"model", "m"},
+                                    {"max_tokens", 8},
+                                    {"messages", Json::array({Json{
+                                         {"role", "assistant"},
+                                         {"content", Json::array({Json{{"type", "mystery_block"}}})}}})}};
+    failures += check(throws_api([&] {
+                          (void)parse_messages_request(unknown_assistant, default_limits());
+                      }),
+                      "unknown assistant content block was accepted");
+    return failures;
+}
+
 int test_thinking_and_sampling() {
     int failures                = 0;
     Json body                   = {{"model", "m"},
@@ -812,6 +1002,7 @@ int main() {
     failures += test_parse_image();
     failures += test_tools_and_choice();
     failures += test_tool_use_result_roundtrip();
+    failures += test_tool_reference_degradation();
     failures += test_thinking_and_sampling();
     failures += test_reasoning_effort();
     failures += test_stop_reason_mapping();

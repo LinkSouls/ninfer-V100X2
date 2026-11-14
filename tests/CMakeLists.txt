@@ -307,7 +307,11 @@ ninfer_add_test(ninfer_response_store_test
   LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_anthropic_schema_test
   SOURCES test_anthropic_schema.cpp
+  NEEDS_SOURCE_DIR
   LIBRARIES ninfer_serve)
+target_include_directories(ninfer_anthropic_schema_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 ninfer_add_test(ninfer_tool_call_parser_test
   SOURCES test_tool_call_parser.cpp
   LIBRARIES ninfer_serve)

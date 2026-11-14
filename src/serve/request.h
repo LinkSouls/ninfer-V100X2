@@ -196,6 +196,11 @@ struct GenerationRequest {
     bool preserve_thinking_semantic_change = false;
     SamplingParams sampling;
 
+    // Number of Anthropic `tool_reference` blocks that were degraded to empty tool results.
+    // A request-level property (not per-turn): it records how many placeholder blocks the
+    // client sent, so the request log can show that the client used a deferred-tool path.
+    std::size_t tool_reference_count = 0;
+
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;
     }

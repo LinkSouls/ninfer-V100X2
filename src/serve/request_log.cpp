@@ -165,22 +165,28 @@ Json overrides_json(const ninfer::SamplingOverrides& overrides) {
 }
 
 Json request_json(const RequestLogContext& context) {
-    return Json{{"request_id", context.id},
-                {"protocol", context.protocol},
-                {"model", context.model},
-                {"stream", context.stream},
-                {"message_count", context.message_count},
-                {"media_item_count", context.media_item_count},
-                {"requested_output_tokens", context.requested_output_tokens},
-                {"requested_output_tokens_source",
-                 context.requested_output_tokens_client_set ? "client" : "server_default"},
-                {"tool_count", context.tool_count},
-                {"tool_choice", tool_choice_name(context.tool_choice)},
-                {"has_tool_history", context.has_tool_history},
-                {"enable_thinking", context.enable_thinking},
-                {"preserve_thinking", context.preserve_thinking},
-                {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
-                {"sampling", sampler_json(context.sampling)}};
+    Json request{{"request_id", context.id},
+                 {"protocol", context.protocol},
+                 {"model", context.model},
+                 {"stream", context.stream},
+                 {"message_count", context.message_count},
+                 {"media_item_count", context.media_item_count},
+                 {"requested_output_tokens", context.requested_output_tokens},
+                 {"requested_output_tokens_source",
+                  context.requested_output_tokens_client_set ? "client" : "server_default"},
+                 {"tool_count", context.tool_count},
+                 {"tool_choice", tool_choice_name(context.tool_choice)},
+                 {"has_tool_history", context.has_tool_history},
+                 {"enable_thinking", context.enable_thinking},
+                 {"preserve_thinking", context.preserve_thinking},
+                 {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
+                 {"sampling", sampler_json(context.sampling)}};
+    // Only present when the request actually carried degraded tool_reference blocks, so the
+    // common case keeps the log line compact and the field reads as "something unusual".
+    if (context.tool_reference_count != 0) {
+        request["tool_reference_count"] = context.tool_reference_count;
+    }
+    return request;
 }
 
 Json preparation_json(const RequestLogContext& context) {
@@ -310,6 +316,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.tool_count                         = request.tools.size();
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();
+    context.tool_reference_count               = request.tool_reference_count;
     context.enable_thinking                    = prepared.enable_thinking;
     context.preserve_thinking                  = prepared.preserve_thinking;
     context.preserve_thinking_semantic_change  = prepared.preserve_thinking_semantic_change;
@@ -352,6 +359,9 @@ std::string format_request_start(const RequestLogContext& context) {
         << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off")
         << " preserve_change=" << (context.preserve_thinking_semantic_change ? "yes" : "no")
         << " sampler=[" << sampler_str(context.sampling) << ']';
+    if (context.tool_reference_count != 0) {
+        out << " tool_reference=" << context.tool_reference_count;
+    }
     if (context.media_item_count != 0) {
         out << " prepare=" << seconds_str(context.preparation.seconds)
             << " acquire=" << seconds_str(context.acquisition_seconds)

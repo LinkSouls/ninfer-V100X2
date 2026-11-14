@@ -252,7 +252,13 @@ ToolCall parse_tool_use(const Json& block) {
     return call;
 }
 
-std::vector<ContentPart> parse_tool_result_content(const Json& block) {
+// Anthropic clients that defer tool loading (Claude Code's Tool Search) may return a
+// `tool_reference` block inside `tool_result.content`. It carries only `tool_name` -- the
+// "this tool's schema is loaded" signal -- and no text that could be fed back to the model.
+// The official API accepts it; we degrade it to an empty tool result so the turn structure
+// (and the tool_use/tool_result pairing) survives, and count it so the degradation stays
+// visible in the request log.
+std::vector<ContentPart> parse_tool_result_content(const Json& block, GenerationRequest& out) {
     if (!block.contains("content") || block.at("content").is_null()) {
         return {ContentPart{ContentKind::Text, {}, "text"}};
     }
@@ -262,20 +268,31 @@ std::vector<ContentPart> parse_tool_result_content(const Json& block) {
     }
     if (content.is_array()) {
         std::vector<ContentPart> parts;
+        bool only_tool_reference = !content.empty();
         for (const Json& part : content) {
             const std::string type = require_block_type(part, "messages");
             if (type == "text") {
+                only_tool_reference = false;
                 parts.push_back(ContentPart{
                     ContentKind::Text, require_string_field(part, "text", "text block"), "text"});
             } else if (type == "image") {
+                only_tool_reference = false;
                 ContentPart image;
                 image.kind     = ContentKind::Image;
                 image.type_raw = "image";
                 image.source   = parse_image_source(part);
                 parts.push_back(std::move(image));
+            } else if (type == "tool_reference") {
+                // Placeholder only: no content, but counted for observability.
+                ++out.tool_reference_count;
             } else {
                 bad_request("unsupported tool_result content block: " + type, "messages");
             }
+        }
+        if (only_tool_reference) {
+            // Degenerate to the same shape as an empty string result so the rendered prompt is
+            // byte-identical to what the client would have produced without tool_reference.
+            return {ContentPart{ContentKind::Text, {}, "text"}};
         }
         return parts;
     }
@@ -338,7 +355,7 @@ void parse_user_content(const Json& content, GenerationRequest& out) {
             ChatTurn tool_turn;
             tool_turn.role         = ChatRole::Tool;
             tool_turn.tool_call_id = block.at("tool_use_id").get<std::string>();
-            tool_turn.content      = parse_tool_result_content(block);
+            tool_turn.content      = parse_tool_result_content(block, out);
             out.messages.push_back(std::move(tool_turn));
         } else if (type == "image") {
             ContentPart part;
