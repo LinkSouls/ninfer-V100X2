@@ -303,6 +303,12 @@ bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
     // store) for every tile. ChunkedSmallT is the correct fallback -- slower, but it is the path
     // 16q/2kv prefill used before the flash route existed. Re-enabling that geometry means
     // reconciling the two cols_per_warp definitions upstream first.
+    // p3 kv-cache-rotation: the flash append kernel rotates each K/V row (D256) before
+    // group-64 quantization, the INT8 Q staging applies the same row transform, and the
+    // INT8 output epilogue undoes the V rotation exactly once after the merge -- so an
+    // INT8 cache stays self-consistent on this route (every writer and reader uses the
+    // rotated coordinates, including chunks appended by the chunked/decode routes).
+    // BF16 is unaffected (no rotation) and keeps its original elementwise kernels.
     return (q_heads == 24 || q_heads == 12 || q_heads == 6) && batch_size == 1 &&
            (cache_dtype == DType::BF16 || cache_dtype == DType::I8) &&
            width >= detail::kVoltaFlashMinimumWidth;

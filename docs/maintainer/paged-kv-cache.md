@@ -1325,6 +1325,45 @@ update/upload validation不执行consumer，不能因此扫描或清零整个phy
 - page boundary回退到保留的continuous-cache kernel；
 - 把 exact-`B` invocation 永久 padding 到 `max_concurrency` 并读取 inactive table rows。
 
+### 17.9 INT8-G64 的 D256 Hadamard 旋转语义
+
+INT8-G64 路径在量化坐标上施加固定的归一化 Sylvester D256 正交旋转（`src/ops/kernel/hadamard_d256.cuh`，
+`gqa_hadamard_d256_inplace` / `gqa_hadamard_d256_contiguous_inplace`），BF16 路径不变。
+
+- **写入侧**：所有 INT8 写缓存路径（prefill fill/fill-page、SIMT tiled decode append
+  （TokenTile 1–2 短解码与 ChunkedSmallT 的尾块）、tc-volta、QPN 三个变体）在
+  `absmax/127` 量化之前对 key 与 value 行先做同一旋转（一 warp 承载整行 256 维，
+  lane `l` 持 `l + 32*r`）。code 与 scale 平面的布局、宽度、索引与未旋转
+  路径完全一致，只有数值不同。旋转摊平离群 channel 的能量分布，降低对称量化的坐标误差。
+  **新增任何 INT8 写缓存路径时必须同步接入旋转**——曾有两个漏接（tiled decode append、
+  flash append）被严格化后的 fixture 以整行 code/scale 失配捕获。
+- **Q 侧**：Q 在注意力 kernel 内做同样的瞬时旋转（不写缓存），因此 `Q·K` 在正交变换下不变。
+- **输出侧**：PV 输出位于旋转后的 value 坐标，必须撤销旋转。prefill 在 kernel 内用已死的 smem arena
+  暂存整行后逐行施加同一变换（该变换是归一化正交 Hadamard，自逆）；decode 在 split reduce 之后由
+  一次性 `gqa_attention_small_t_inverse_rotate_kernel` 完成。撤销必须发生在分支归约合并之后。
+  该 kernel 的 Masked 跳过条件必须用**请求内**列号（`token + column_begin`）与
+  `valid_columns[batch]` 比较；用绝对 `output_column`（含 `batch * full_width` 偏移）会跳过
+  所有 batch≥1 请求的撤销，使输出残留在旋转后坐标。
+- **路由**：VoltaFlash 路由（width ≥ 64 单 batch prefill）服务 BF16 与 INT8 KV。INT8 分支是
+  旋转感知的：append kernel 一 warp 承载整行 D256，先旋转 K/V 再按 group-64 `absmax/127` 量化
+  （code/scale 布局与未旋转路径一致）；INT8 Q staging 施加同一行旋转（普通 Flash 的
+  `volta_flash_convert_q_i8_kernel` 与 split-D 的 `prepare_q_rotated`）；输出侧在 stream-K
+  fixup / split-D 合并归一化之后，由 `volta_flash_convert_out_i8_kernel` 把 FP32 结果逆旋转
+  恰好一次再转 BF16（融合进既有转换 kernel，不新增独立旋转 kernel 或中间张量）。已有旋转缓存
+  与新追加数据因此共享同一坐标。BF16 分支保持逐元素 kernel 与变更前行为。见
+  `gqa_attention.cpp` 的 `volta_flash_route_possible`（`DType::BF16 || DType::I8`）。
+- **判定口径**：旋转改变 FP32 加法结合顺序，logits、MTP 接受率与生成 token 与未旋转路径**不逐位一致**，
+  属预期。正确性以独立朴素 FP32 oracle 的容差等价判定（`tests/ops/test_hadamard_d256.cpp` 给出变换的
+  正交性/自逆性与 group-64 量化失真不劣化的 CPU 证据；`test_hadamard_d256_device.cu` 与 vendored
+  上游参照逐位一致），不以生产实现互相对比、更不要求逐位一致。INT8 注意力契约
+  （`kAttentionInt8Criterion`）的 `gross_absolute` 重校准历史 1.1e-3（未旋转 61 用例定标）→ 2.2e-3
+  （旋转 FP 结合代价，实测需求 2.01e-3）→ 3.2e-3（128-token 新 prefill 用例，旋转侧需求 2.92e-3；
+  未旋转基线在同一形状下对旧定标同样超标，故该步由形状而非旋转驱动）。`relative_l2` 不变，仍为主
+  精度指标。操作员级 64 用例对照中旋转侧 rel_l2 占比最高 0.95×，"端到端不劣化"由整机对公共 oracle
+  的测量判定，不由本层替代。
+- **禁止**：为旋转引入独立的量化/反量化/旋转 kernel 或中间张量（会破坏减半带宽目标）；对 BF16 路径
+  施加旋转；只旋转 K 不旋转 V（收益减半且与输出侧撤销不对称）。
+
 ---
 
 ## 18. Correctness qualification

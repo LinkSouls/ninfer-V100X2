@@ -6,7 +6,10 @@ namespace ninfer::ops::detail {
 // FP16 staging has ceil(tokens/64)*64*q_heads*256 elements. Gathered K/V
 // must include zero-filled rows through ceil(kv_tokens/32)*32. Positions
 // control every causal score; output contains only the valid query rows.
+// rotate: when the KV cache rows carry the INT8 D256 rotation, the Q staging
+// applies the same row transform (K is already rotated by the writer) and the
+// caller must undo it on the output; BF16 leaves both untouched.
 void gqa_attention_volta_splitd_launch(const __nv_bfloat16* q, const half* k, const half* v,
     const int* positions, half* q_stage, float* out, int tokens, int kv_tokens,
-    int q_heads, int kv_heads, float scale, cudaStream_t stream);
+    int q_heads, int kv_heads, float scale, cudaStream_t stream, bool rotate);
 }

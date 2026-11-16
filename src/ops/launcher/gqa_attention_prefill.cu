@@ -72,8 +72,7 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
             constexpr int kTokensPerTile = 8;
             const int max_tiles          = div_up(tokens + kTokensPerTile - 1, kTokensPerTile);
             const dim3 fill_grid(static_cast<unsigned>(max_tiles),
-                                 static_cast<unsigned>(Geometry::KVHeads),
-                                 static_cast<unsigned>(kGqaKvQuantGroups));
+                                 static_cast<unsigned>(Geometry::KVHeads));
             gqa_attention_prefill_fill_i8_page_kernel<Geometry, Metadata>
                 <<<fill_grid, kPageBlock, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(k.data),
@@ -86,7 +85,7 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
         } else {
             constexpr int kFillWarps = kFillBlock / 32;
             const std::int64_t fill_units =
-                static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kGqaKvQuantGroups;
+                static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
             const int fill_grid =
                 static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
             gqa_attention_prefill_fill_i8_kernel<Geometry, Metadata>

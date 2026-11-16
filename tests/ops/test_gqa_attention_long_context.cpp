@@ -129,15 +129,23 @@ std::vector<double> long_reference(const std::vector<float>& q, const HostCache&
     std::vector<double> scores(static_cast<std::size_t>(visible));
     std::vector<double> output(heads.size() * static_cast<std::size_t>(kHeadDim));
 
+    // p3 kv-cache-rotation: the INT8 cache lives in the D256 rotated coordinates, so the oracle
+    // must mirror the fixture's ideal_attention: score in rotated space ((Hq)·(Hk) == q·k) and
+    // undo the V rotation on the output row (the transform is an involution).
+    const bool rotated = cache.dtype == DType::I8;
     for (std::size_t slot = 0; slot < heads.size(); ++slot) {
         const std::int32_t q_head  = heads[slot];
         const std::int32_t kv_head = q_head / geometry.query_group();
-        double max_score           = -std::numeric_limits<double>::infinity();
+        std::vector<float> q_rot;
+        if (rotated) { q_rot = d256_rotate(q.data() + q_index(geometry, q_head, 0, 0)); }
+        double max_score = -std::numeric_limits<double>::infinity();
         for (std::int32_t key = 0; key < visible; ++key) {
             double dot = 0.0;
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                dot += static_cast<double>(q[q_index(geometry, q_head, d, 0)]) *
-                       cache_value(cache, true, kv_head, key, d);
+                const double qv = rotated
+                                      ? static_cast<double>(q_rot[static_cast<std::size_t>(d)])
+                                      : static_cast<double>(q[q_index(geometry, q_head, d, 0)]);
+                dot += qv * cache_value(cache, true, kv_head, key, d);
             }
             const double score                    = dot * static_cast<double>(kAttentionScale);
             scores[static_cast<std::size_t>(key)] = score;
@@ -149,14 +157,24 @@ std::vector<double> long_reference(const std::vector<float>& q, const HostCache&
             scores[static_cast<std::size_t>(key)] = probability;
             sum += probability;
         }
+        std::vector<double> row(static_cast<std::size_t>(kHeadDim));
         for (std::int32_t d = 0; d < kHeadDim; ++d) {
             double value = 0.0;
             for (std::int32_t key = 0; key < visible; ++key) {
                 value += scores[static_cast<std::size_t>(key)] *
                          cache_value(cache, false, kv_head, key, d);
             }
+            row[static_cast<std::size_t>(d)] = value / sum;
+        }
+        if (rotated) {
+            const std::vector<double> undone = d256_rotate(row.data());
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                row[static_cast<std::size_t>(d)] = undone[static_cast<std::size_t>(d)];
+            }
+        }
+        for (std::int32_t d = 0; d < kHeadDim; ++d) {
             output[slot * static_cast<std::size_t>(kHeadDim) + static_cast<std::size_t>(d)] =
-                value / sum;
+                row[static_cast<std::size_t>(d)];
         }
     }
     return output;

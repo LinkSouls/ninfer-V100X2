@@ -461,6 +461,16 @@ ninfer_add_op_test(ninfer_mtp_split_test
 ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
   LIBRARIES ninfer_ops)
+# p3 kv-cache-rotation oracles: the CPU mathematical oracle (orthogonality, involution, naive
+# FP32 attention reference, rotated<=unrotated quantization distortion) and the device bit-match
+# of the D256 primitive against the exact host model of its association order.
+ninfer_add_op_test(ninfer_hadamard_d256_test
+  SOURCES ops/test_hadamard_d256.cpp)
+ninfer_add_op_test(ninfer_hadamard_d256_device_test
+  SOURCES ops/test_hadamard_d256_device.cu
+  LIBRARIES ninfer_ops)
+target_compile_options(ninfer_hadamard_d256_device_test PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-fast-math,-ffp-contract=off>)
 ninfer_add_op_test(ninfer_ram_kv_test
   SOURCES ops/test_ram_kv.cpp
   LIBRARIES ninfer_ops)

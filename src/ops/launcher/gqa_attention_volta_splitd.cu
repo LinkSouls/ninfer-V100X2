@@ -9,6 +9,7 @@
 #include <cmath>
 #include "ops/launcher/gqa_attention_volta_splitd.h"
 #include "ops/launcher/kernel_attr_once.h"
+#include "ops/kernel/hadamard_d256.cuh"
 
 namespace cute {
 struct SM70_LDG_GLOBAL_CG_128b : UniversalCopy<uint_bit_t<128>> {
@@ -856,18 +857,51 @@ __global__ void prepare_q(const __nv_bfloat16* q, cutlass::half_t* staged,
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < padded_count) staged[i] = cutlass::half_t(i < count ? __bfloat162float(q[i]) : 0.0f);
 }
+
+// INT8-only Q staging: the gathered K rows carry the D256 rotation the INT8 writer
+// applied, so Q rows must carry the same transform (Q·(HK)ᵀ == (HQ)·Kᵀ). One warp
+// rotates one (token, q_head) row in registers before the FP16 store; the row's 256
+// elements are contiguous at row * 256. Padding rows stage as zeros, and the
+// transform maps zero to zero, so a single uniform launch covers both. The output
+// stays in rotated-V coordinates; the caller undoes it exactly once.
+__global__ void prepare_q_rotated(const __nv_bfloat16* q, cutlass::half_t* staged,
+                                  int rows, int valid_rows) {
+  constexpr int kWarpsPerBlock = 8;
+  const int row = blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5);
+  if (row >= rows) return;
+  const int lane = threadIdx.x & 31;
+  const int64_t base = static_cast<int64_t>(row) * 256;
+  float values[8];
+#pragma unroll
+  for (int r = 0; r < 8; ++r) {
+    const int d = lane + 32 * r;
+    values[r] = (row < valid_rows) ? __bfloat162float(q[base + d]) : 0.0f;
+  }
+  gqa_hadamard_d256_inplace(values, lane);
+#pragma unroll
+  for (int r = 0; r < 8; ++r) {
+    staged[base + lane + 32 * r] = cutlass::half_t(values[r]);
+  }
+}
 } // namespace
 
 void gqa_attention_volta_splitd_launch(const __nv_bfloat16* q, const half* k, const half* v,
     const int* positions, half* q_stage, float* out, int tokens, int kv_tokens,
-    int q_heads, int kv_heads, float scale, cudaStream_t stream) {
+    int q_heads, int kv_heads, float scale, cudaStream_t stream, bool rotate) {
   ensure_func_attr_per_device(splitd_prefill_kernel,
       cudaFuncAttributeMaxDynamicSharedMemorySize, Sm70D256SplitDTraits::kSmemBytes);
   const int padded = (tokens + 63) / 64 * 64;
   const int count = tokens * q_heads * 256;
   const int padded_count = padded * q_heads * 256;
-  prepare_q<<<(padded_count + 255) / 256,256,0,stream>>>(
-      q, reinterpret_cast<cutlass::half_t*>(q_stage), count, padded_count);
+  if (rotate) {
+    const int rows = padded_count / 256;
+    const int valid_rows = count / 256;
+    prepare_q_rotated<<<(rows + 7) / 8, 256, 0, stream>>>(
+        q, reinterpret_cast<cutlass::half_t*>(q_stage), rows, valid_rows);
+  } else {
+    prepare_q<<<(padded_count + 255) / 256,256,0,stream>>>(
+        q, reinterpret_cast<cutlass::half_t*>(q_stage), count, padded_count);
+  }
   splitd_prefill_kernel<<<dim3(padded/64,1,q_heads),256,
       Sm70D256SplitDTraits::kSmemBytes,stream>>>(
       reinterpret_cast<const cutlass::half_t*>(q_stage),

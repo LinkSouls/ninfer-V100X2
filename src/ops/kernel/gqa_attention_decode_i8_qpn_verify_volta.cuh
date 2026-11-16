@@ -3,6 +3,7 @@
 #include "ops/common/volta_mma.cuh"
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
+#include "ops/kernel/hadamard_d256.cuh"
 
 namespace ninfer::ops {
 
@@ -84,39 +85,65 @@ __global__ __launch_bounds__(256, 1) void gqa_attention_verify_qpn_volta_partial
     const int first_page = begin >> kPagedKVPageShift;
     const int page_count = ((end - 1) >> kPagedKVPageShift) - first_page + 1;
     for (int i = tid; i < page_count; i += 256) pages[i] = table[first_page + i];
-    for (int i = tid; i < RowTiles * 8 * D; i += 256) {
-        const int row = i / D, dim = i % D;
-        qs[row * Stride + dim] = row < Rows && row % T < valid_tokens
-            ? __float2half(__bfloat162float(q[gqa_q_index<G>(head * G::GroupSize + row / T,
-                                                            dim, row % T)]))
-            : __ushort_as_half(0);
+    // Stage Q, rotating each D256 row (one warp per row) so the Q side carries the same Hadamard
+    // coordinates as the (rotated) K (see hadamard_d256.cuh).
+    for (int row = warp; row < RowTiles * 8; row += 8) {
+        float q_vals[8] = {};
+        if (row < Rows && row % T < valid_tokens) {
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int dim = lane + 32 * r;
+                q_vals[r] = __bfloat162float(q[gqa_q_index<G>(head * G::GroupSize + row / T, dim,
+                                                              row % T)]);
+            }
+        }
+        gqa_hadamard_d256_inplace(q_vals, lane);
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int dim = lane + 32 * r;
+            qs[row * Stride + dim] = __float2half(q_vals[r]);
+        }
     }
     if constexpr (CacheInput::writes_cache) {
-        for (int pair = warp; pair < valid_tokens * kGqaKvQuantGroups; pair += 8) {
-            const int token = pair / kGqaKvQuantGroups, group = pair % kGqaKvQuantGroups;
+        // One warp owns the full D256 row (lane l holds dims l + 32*r); rotate K and V, then
+        // quantize all four 64-groups (see hadamard_d256.cuh).
+        for (int token = warp; token < valid_tokens; token += 8) {
             const int position = positions[token];
             if (position < begin || position >= end) continue;
-            const int page = table[position >> kPagedKVPageShift];
+            const int page   = table[position >> kPagedKVPageShift];
             const int offset = position & kPagedKVPageMask;
-            const int d0 = group * kGqaKvQuantGroup + lane, d1 = d0 + 32;
-            const float k0 = __bfloat162float(input.k[gqa_kv_new_index<G>(head, d0, token)]);
-            const float k1 = __bfloat162float(input.k[gqa_kv_new_index<G>(head, d1, token)]);
-            const float v0 = __bfloat162float(input.v[gqa_kv_new_index<G>(head, d0, token)]);
-            const float v1 = __bfloat162float(input.v[gqa_kv_new_index<G>(head, d1, token)]);
-            const float ka = warp_max(fmaxf(fabsf(k0), fabsf(k1)), Mask);
-            const float va = warp_max(fmaxf(fabsf(v0), fabsf(v1)), Mask);
-            const half kscale = __float2half_rn(ka > 0.0f ? ka / 127.0f : 0.0f);
-            const half vscale = __float2half_rn(va > 0.0f ? va / 127.0f : 0.0f);
-            const float ki = __half2float(kscale) > 0.0f ? 1.0f / __half2float(kscale) : 0.0f;
-            const float vi = __half2float(vscale) > 0.0f ? 1.0f / __half2float(vscale) : 0.0f;
-            keys[gqa_kv_quant_code_index<G>(page, head, d0, offset)] = gqa_kv_quant_code(k0, ki);
-            keys[gqa_kv_quant_code_index<G>(page, head, d1, offset)] = gqa_kv_quant_code(k1, ki);
-            values[gqa_kv_quant_code_index<G>(page, head, d0, offset)] = gqa_kv_quant_code(v0, vi);
-            values[gqa_kv_quant_code_index<G>(page, head, d1, offset)] = gqa_kv_quant_code(v1, vi);
-            if (lane == 0) {
-                const auto index = gqa_kv_quant_scale_index<G>(page, head, group, offset);
-                key_scales[index] = kscale;
-                value_scales[index] = vscale;
+            float k_vals[8] = {}, v_vals[8] = {};
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int d = lane + 32 * r;
+                k_vals[r]   = __bfloat162float(input.k[gqa_kv_new_index<G>(head, d, token)]);
+                v_vals[r]   = __bfloat162float(input.v[gqa_kv_new_index<G>(head, d, token)]);
+            }
+            gqa_hadamard_d256_inplace(k_vals, lane);
+            gqa_hadamard_d256_inplace(v_vals, lane);
+#pragma unroll
+            for (int grp = 0; grp < kGqaKvQuantGroups; ++grp) {
+                const int d0  = grp * kGqaKvQuantGroup + lane;
+                const int d1  = d0 + 32;
+                const float k0 = k_vals[2 * grp];
+                const float k1 = k_vals[2 * grp + 1];
+                const float v0 = v_vals[2 * grp];
+                const float v1 = v_vals[2 * grp + 1];
+                const float ka = warp_max(fmaxf(fabsf(k0), fabsf(k1)), Mask);
+                const float va = warp_max(fmaxf(fabsf(v0), fabsf(v1)), Mask);
+                const half kscale = __float2half_rn(ka > 0.0f ? ka / 127.0f : 0.0f);
+                const half vscale = __float2half_rn(va > 0.0f ? va / 127.0f : 0.0f);
+                const float ki = __half2float(kscale) > 0.0f ? 1.0f / __half2float(kscale) : 0.0f;
+                const float vi = __half2float(vscale) > 0.0f ? 1.0f / __half2float(vscale) : 0.0f;
+                keys[gqa_kv_quant_code_index<G>(page, head, d0, offset)] = gqa_kv_quant_code(k0, ki);
+                keys[gqa_kv_quant_code_index<G>(page, head, d1, offset)] = gqa_kv_quant_code(k1, ki);
+                values[gqa_kv_quant_code_index<G>(page, head, d0, offset)] = gqa_kv_quant_code(v0, vi);
+                values[gqa_kv_quant_code_index<G>(page, head, d1, offset)] = gqa_kv_quant_code(v1, vi);
+                if (lane == 0) {
+                    const auto index = gqa_kv_quant_scale_index<G>(page, head, grp, offset);
+                    key_scales[index] = kscale;
+                    value_scales[index] = vscale;
+                }
             }
         }
     }

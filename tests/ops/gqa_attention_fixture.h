@@ -66,7 +66,18 @@ constexpr ReductionCriterion kAttentionBf16Criterion{
 
 constexpr ReductionCriterion kAttentionInt8Criterion{
     /*relative_l2*/ 3.15e-3,
-    /*gross_absolute*/ 1.1e-3,
+    // p3 kv-cache-rotation: gross_absolute history: 1.1e-3 (UNrotated, 61-case calibration) ->
+    // 2.2e-3 (rotation FP-association cost, worst measured 2.01e-3) -> 3.2e-3. The 3.2e-3 step
+    // is driven by the 128-token fresh-prefill case (16q, T=128, max_ref ~1.0): the ROTATED path
+    // needs gross 2.92e-3 (max_abs 5.02e-3 at limit rel 2.2e-3), and the UNrotated baseline on the
+    // same case already needs 1.25e-3 ABOVE its original 1.1e-3 -- so the new shape, not the
+    // rotation, invalidated the old calibration. 3.2e-3 = 2.92e-3 with ~10% margin (same
+    // convention as the 2.2e-3 step). relative_l2 is unchanged -- it is the primary accuracy
+    // metric; the rotated path's kernel-level rel_l2 sits within 0.95x of the limit on all 64
+    // INT8 cases, and the end-to-end "no degradation" judgment (spec requirement) is made at the
+    // whole-model tier against a common oracle, not from this per-tree operator comparison.
+    // This is the spec's "judge the rotated path by tolerance, not bit-identity" contract.
+    /*gross_absolute*/ 3.2e-3,
     /*gross_relative_to_max_reference*/ 2.2e-3,
 };
 
@@ -391,6 +402,33 @@ struct HostCache {
     std::vector<std::uint16_t> v_scale;
 };
 
+// p3 kv-cache-rotation: the INT8-G64 path quantizes in the coordinates of a fixed normalized
+// Sylvester D256 rotation (src/ops/kernel/hadamard_d256.cuh), and undoes it on the attention
+// output. This host model applies the SAME transform with an independent naive association
+// order (eight full-row butterfly stages, then the 2^-4 normalization), in the precision of
+// the element type. It deliberately does NOT reuse the device warp-shuffle association order,
+// so it is not bit-identical to the device result: at a .5 code boundary the predicted int8
+// code can differ by one step. That is exactly why the INT8 cache checks below BOUND the
+// code/scale delta (one step / one fp16 ulp) instead of demanding a bit-exact cache -- the
+// kv-cache-rotation contract is tolerance equivalence, not bit identity.
+template <typename T>
+[[nodiscard]] inline std::vector<T> d256_rotate(const T* row) {
+    std::vector<T> v(row, row + kHeadDim);
+    for (int stage = 0; stage < 8; ++stage) {
+        const int half = 1 << stage;
+        for (int block = 0; block < kHeadDim; block += 2 * half) {
+            for (int i = 0; i < half; ++i) {
+                const T a = v[block + i];
+                const T b = v[block + i + half];
+                v[block + i]        = a + b;
+                v[block + i + half] = a - b;
+            }
+        }
+    }
+    for (auto& x : v) { x = x * static_cast<T>(0.0625); }
+    return v;
+}
+
 inline void encode_group(const std::vector<float>& source, std::size_t source_base,
                   std::vector<std::int8_t>& codes, std::size_t code_base,
                   std::vector<std::uint16_t>& scales, std::size_t scale_offset) {
@@ -435,13 +473,18 @@ inline HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t 
     cache.v_scale.assign(scales, 0);
     for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
         for (std::int32_t position = 0; position < logical_capacity; ++position) {
+            // p3: the INT8 codec runs in the rotated coordinates; rotate each 256-dim row
+            // (FP64 ideal model) before the group-64 absmax/127 quantization.
+            const std::size_t row = cache_index(geometry, logical_capacity, head, position, 0);
+            const std::vector<float> k_rot = d256_rotate(logical_k.data() + row);
+            const std::vector<float> v_rot = d256_rotate(logical_v.data() + row);
             for (std::int32_t group = 0; group < kQuantGroups; ++group) {
                 const std::int32_t d   = group * kQuantGroup;
-                const std::size_t code = cache_index(geometry, logical_capacity, head, position, d);
+                const std::size_t code = row + d;
                 const std::size_t scale =
                     scale_index(geometry, logical_capacity, head, position, group);
-                encode_group(logical_k, code, cache.k_i8, code, cache.k_scale, scale);
-                encode_group(logical_v, code, cache.v_i8, code, cache.v_scale, scale);
+                encode_group(k_rot, d, cache.k_i8, code, cache.k_scale, scale);
+                encode_group(v_rot, d, cache.v_i8, code, cache.v_scale, scale);
             }
         }
     }
@@ -465,15 +508,19 @@ inline void append_cache(HostCache& cache, const std::vector<float>& k, const st
                 continue;
             }
 
+            // p3: rotate each appended row (FP64 ideal model) before the group-64 codec,
+            // matching the device write path.
+            const std::size_t k_src = kv_input_index(geometry, head, 0, token);
+            const std::vector<float> k_rot = d256_rotate(k.data() + k_src);
+            const std::vector<float> v_rot = d256_rotate(v.data() + k_src);
             for (std::int32_t group = 0; group < kQuantGroups; ++group) {
                 const std::int32_t d     = group * kQuantGroup;
-                const std::size_t source = kv_input_index(geometry, head, d, token);
                 const std::size_t target =
                     cache_index(geometry, cache.logical_capacity, head, position, d);
                 const std::size_t scale =
                     scale_index(geometry, cache.logical_capacity, head, position, group);
-                encode_group(k, source, cache.k_i8, target, cache.k_scale, scale);
-                encode_group(v, source, cache.v_i8, target, cache.v_scale, scale);
+                encode_group(k_rot, d, cache.k_i8, target, cache.k_scale, scale);
+                encode_group(v_rot, d, cache.v_i8, target, cache.v_scale, scale);
             }
         }
     }
@@ -513,13 +560,22 @@ inline std::vector<double> ideal_attention(const std::vector<float>& q, const Ho
         const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
         for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
             const std::int32_t kv_head = q_head / geometry.query_group();
-            double max_score           = -std::numeric_limits<double>::infinity();
+            // p3: INT8 KV lives in rotated coordinates. Score in the rotated space
+            // ((Hq)·(Hk) == q·k, H orthogonal) and undo the V rotation on the PV row (the
+            // transform is an involution) so the output matches the un-rotated model.
+            const bool rotated = cache.dtype == DType::I8;
+            const std::vector<float> q_rot =
+                rotated ? d256_rotate(q.data() + q_index(geometry, q_head, 0, token))
+                        : std::vector<float>();
+            double max_score = -std::numeric_limits<double>::infinity();
             for (std::int32_t position = 0; position < visible; ++position) {
                 if (!selected(position)) { continue; }
                 double dot = 0.0;
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    dot += static_cast<double>(q[q_index(geometry, q_head, d, token)]) *
-                           cache_value(cache, true, kv_head, position, d);
+                    const double qv = rotated
+                                          ? q_rot[static_cast<std::size_t>(d)]
+                                          : static_cast<double>(q[q_index(geometry, q_head, d, token)]);
+                    dot += qv * cache_value(cache, true, kv_head, position, d);
                 }
                 const double score = dot * static_cast<double>(kAttentionScale);
                 scores[static_cast<std::size_t>(position)] = score;
@@ -545,6 +601,19 @@ inline std::vector<double> ideal_attention(const std::vector<float>& q, const Ho
                              cache_value(cache, false, kv_head, position, d);
                 }
                 output[q_index(geometry, q_head, d, token)] = value;
+            }
+
+            if (rotated) {
+                const std::size_t out_base = q_index(geometry, q_head, 0, token);
+                std::vector<double> row(static_cast<std::size_t>(kHeadDim));
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    row[static_cast<std::size_t>(d)] = output[out_base + static_cast<std::size_t>(d)];
+                }
+                const std::vector<double> undone = d256_rotate(row.data());
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    output[out_base + static_cast<std::size_t>(d)] =
+                        undone[static_cast<std::size_t>(d)];
+                }
             }
         }
     }
@@ -704,6 +773,15 @@ private:
     GuardedDeviceBuffer block_table_;
 };
 
+// p3: bounded INT8 cache comparison -- the device's FP32 shuffle rotation vs this fixture's
+// FP64 ideal model can flip one code step / one fp16 scale ulp at a rounding boundary
+// (definitions below, after BatchDeviceCache, which uses them in its verify()).
+inline int verify_close_int8_codes(const std::string& label, const std::vector<std::int8_t>& got,
+                     const std::vector<std::int8_t>& expected);
+inline int verify_close_f16_scales(const std::string& label,
+                     const std::vector<std::uint16_t>& got,
+                     const std::vector<std::uint16_t>& expected);
+
 class BatchDeviceCache {
 public:
     BatchDeviceCache(std::span<const HostCache> rows, MappingPattern mapping)
@@ -800,17 +878,17 @@ public:
                                    logical_capacity_, table, expected_vs);
             }
             failures +=
-                verify_exact((label + " cache-k-code").c_str(),
-                             copy_from_guarded<std::int8_t>(k_, code_elements_), expected_k);
+                verify_close_int8_codes((label + " cache-k-code").c_str(),
+                                        copy_from_guarded<std::int8_t>(k_, code_elements_), expected_k);
             failures +=
-                verify_exact((label + " cache-v-code").c_str(),
-                             copy_from_guarded<std::int8_t>(v_, code_elements_), expected_v);
-            failures += verify_exact((label + " cache-k-scale").c_str(),
-                                     copy_from_guarded<std::uint16_t>(k_scale_, scale_elements_),
-                                     expected_ks);
-            failures += verify_exact((label + " cache-v-scale").c_str(),
-                                     copy_from_guarded<std::uint16_t>(v_scale_, scale_elements_),
-                                     expected_vs);
+                verify_close_int8_codes((label + " cache-v-code").c_str(),
+                                        copy_from_guarded<std::int8_t>(v_, code_elements_), expected_v);
+            failures += verify_close_f16_scales((label + " cache-k-scale").c_str(),
+                                                copy_from_guarded<std::uint16_t>(k_scale_, scale_elements_),
+                                                expected_ks);
+            failures += verify_close_f16_scales((label + " cache-v-scale").c_str(),
+                                                copy_from_guarded<std::uint16_t>(v_scale_, scale_elements_),
+                                                expected_vs);
         }
         failures +=
             verify_exact((label + " block tables unchanged").c_str(),
@@ -888,16 +966,82 @@ private:
     GuardedDeviceBuffer block_tables_;
 };
 
+// p3: bounded INT8 cache comparison. The device's FP32 warp-shuffle rotation and this
+// fixture's FP64 ideal rotation agree to a few ulps, and at a .5 code boundary that flips
+// ONE code step (and at most one fp16 scale ulp). Bigger gaps are defects. Sizes are still
+// checked exactly: the rotation contract is "same layout, different numbers".
+inline int verify_close_int8_codes(const std::string& label, const std::vector<std::int8_t>& got,
+                     const std::vector<std::int8_t>& expected) {
+    if (got.size() != expected.size()) {
+        std::cerr << label << ": code size mismatch " << got.size() << " vs "
+                  << expected.size() << "\n";
+        return 1;
+    }
+    int failures = 0;
+    int max_delta = 0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        const int delta = std::abs(static_cast<int>(got[i]) - static_cast<int>(expected[i]));
+        max_delta       = std::max(max_delta, delta);
+        if (delta > 1) {
+            ++failures;
+            if (failures <= 8) {
+                std::cerr << label << " [" << i << "]: expected code "
+                          << static_cast<int>(expected[i]) << " got " << static_cast<int>(got[i])
+                          << " (delta " << delta << ")\n";
+            }
+        }
+    }
+    if (failures == 0) {
+        std::cout << "ok      " << label << " (" << got.size() << " codes, max delta "
+                  << max_delta << ")\n";
+    } else {
+        std::cerr << label << ": " << failures << " code(s) differ by more than one step\n";
+    }
+    return failures;
+}
+
+inline int verify_close_f16_scales(const std::string& label,
+                     const std::vector<std::uint16_t>& got,
+                     const std::vector<std::uint16_t>& expected) {
+    if (got.size() != expected.size()) {
+        std::cerr << label << ": scale size mismatch " << got.size() << " vs "
+                  << expected.size() << "\n";
+        return 1;
+    }
+    // The stored scales are non-negative fp16, so the bit-pattern order IS the numeric order
+    // and a one-ulp difference is a one-bit difference in the pattern.
+    int failures = 0;
+    int max_ulp  = 0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        const int ulp = std::abs(static_cast<int>(got[i]) - static_cast<int>(expected[i]));
+        max_ulp       = std::max(max_ulp, ulp);
+        if (ulp > 1) {
+            ++failures;
+            if (failures <= 8) {
+                std::cerr << label << " [" << i << "]: expected scale bits " << expected[i]
+                          << " got " << got[i] << " (" << ulp << " ulp)\n";
+            }
+        }
+    }
+    if (failures == 0) {
+        std::cout << "ok      " << label << " (" << got.size() << " scales, max delta "
+                  << max_ulp << " ulp)\n";
+    } else {
+        std::cerr << label << ": " << failures << " scale(s) differ by more than one ulp\n";
+    }
+    return failures;
+}
+
 inline int verify_cache(const std::string& label, const HostCache& got, const HostCache& expected) {
     int failures = 0;
     if (expected.dtype == DType::BF16) {
         failures += verify_exact((label + " cache-k").c_str(), got.k_bf16, expected.k_bf16);
         failures += verify_exact((label + " cache-v").c_str(), got.v_bf16, expected.v_bf16);
     } else {
-        failures += verify_exact((label + " cache-k-code").c_str(), got.k_i8, expected.k_i8);
-        failures += verify_exact((label + " cache-v-code").c_str(), got.v_i8, expected.v_i8);
-        failures += verify_exact((label + " cache-k-scale").c_str(), got.k_scale, expected.k_scale);
-        failures += verify_exact((label + " cache-v-scale").c_str(), got.v_scale, expected.v_scale);
+        failures += verify_close_int8_codes((label + " cache-k-code").c_str(), got.k_i8, expected.k_i8);
+        failures += verify_close_int8_codes((label + " cache-v-code").c_str(), got.v_i8, expected.v_i8);
+        failures += verify_close_f16_scales((label + " cache-k-scale").c_str(), got.k_scale, expected.k_scale);
+        failures += verify_close_f16_scales((label + " cache-v-scale").c_str(), got.v_scale, expected.v_scale);
     }
     return failures;
 }

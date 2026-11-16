@@ -463,6 +463,11 @@ int run_geometry(const Geometry& geometry) {
         const AttentionCase a1_cases[] = {
             {1, 0, 1, 201u},    {6, 17, 23, 202u},   {7, 17, 512, 203u},
             {17, 31, 48, 204u}, {66, 63, 129, 205u},
+            // Fresh prefill at the flash-route width frontier: 128 tokens from column 0
+            // (min == max visible keys, width >= 64), spanning two 64-token pages. 24q/6q
+            // geometries take the flash route (6q through split-D); 16q falls back to
+            // chunked small-T, which keeps this case a cross-route cache-layout check.
+            {128, 0, 128, 206u},
         };
         for (const AttentionCase& test_case : a1_cases) {
             failures += run_a1_case(geometry, dtype, test_case, MappingPattern::Identity);
@@ -549,6 +554,116 @@ int verify_workspace_capacity_contract() {
 
 } // namespace
 
+// p3 kv-cache-rotation: regression guard for the rotation's designed benefit. On a
+// high-energy-channel (outlier) distribution the rotated INT8 path must keep its attention
+// output close to the scheme-independent BF16-derived FP64 reference. The unrotated path crushes
+// the non-outlier dims of an outlier-dominated group (its group scale is set by the outlier) and
+// lands ~0.0105 relative-L2 here, so the 0.008 bound passes for the rotated path (~0.0058) and
+// FAILS if the rotation is dropped -- guarding the benefit, not merely the tolerance.
+int run_outlier_regression_cases() {
+    int failures = 0;
+    struct C { Geometry g; std::int32_t tokens; std::uint32_t seed; };
+    const C cases[] = {
+        {kGeometries[0], 128, 910u},
+        {kGeometries[1], 128, 911u},
+        {kGeometries[2], 128, 912u},
+    };
+    constexpr int kOutlierDims = 8;
+    constexpr float kAmp       = 32.0f;
+    constexpr double kRelBound = 0.008;  // rotated ~0.0058 passes; unrotated ~0.0105 fails.
+    for (const C& c : cases) {
+        const Geometry& geometry = c.g;
+        const std::int32_t tokens = c.tokens;
+        const std::int32_t base   = 1;
+        const std::size_t q_elements =
+            static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(geometry.q_heads) *
+            static_cast<std::size_t>(tokens);
+        const std::size_t kv_elements =
+            static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(geometry.kv_heads) *
+            static_cast<std::size_t>(tokens);
+        std::vector<float> q = make_bf16_values(q_elements, c.seed, -0.25f, 0.25f);
+        const auto make_outlier = [&](std::uint32_t s) {
+            std::vector<float> x = make_bf16_values(kv_elements, s, -0.25f, 0.25f);
+            for (std::size_t row = 0; row * static_cast<std::size_t>(kHeadDim) < kv_elements;
+                 ++row) {
+                for (int d = 0; d < kOutlierDims; ++d) {
+                    x[row * static_cast<std::size_t>(kHeadDim) + static_cast<std::size_t>(d)] *= kAmp;
+                }
+            }
+            return x;
+        };
+        std::vector<float> k = make_outlier(c.seed + 1u);
+        std::vector<float> v = make_outlier(c.seed + 2u);
+        std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
+        for (std::int32_t t = 0; t < tokens; ++t) { positions[t] = base + t; }
+        const std::int32_t max_context = base + tokens + 3;
+        // Scheme-independent reference: FP64 ideal over the BF16 cache (bit-identical across trees).
+        const HostCache bf16_initial = make_cache(geometry, DType::BF16, max_context, c.seed + 10u);
+        HostCache bf16_expected      = bf16_initial;
+        append_cache(bf16_expected, k, v, positions);
+        const std::vector<double> reference = ideal_attention(q, bf16_expected, positions);
+        // This tree's INT8 codec (rotated in the rotated tree).
+        const HostCache i8_initial = make_cache(geometry, DType::I8, max_context, c.seed + 10u);
+        DeviceCache cache(i8_initial, MappingPattern::Identity);
+
+        const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+        const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
+        const std::vector<std::uint16_t> v_bits = to_bf16_bits(v);
+        GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer dk(k_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer dv(v_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer dp(positions.size() * sizeof(std::int32_t));
+        GuardedDeviceBuffer dtable_row(sizeof(std::int32_t));
+        GuardedDeviceBuffer dout(q_bits.size() * sizeof(std::uint16_t));
+        dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+        dk.copy_from_host(k_bits.data(), k_bits.size() * sizeof(std::uint16_t));
+        dv.copy_from_host(v_bits.data(), v_bits.size() * sizeof(std::uint16_t));
+        dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+        const std::int32_t table_row = 0;
+        dtable_row.copy_from_host(&table_row, sizeof(std::int32_t));
+        const std::vector<std::uint16_t> canary(q_bits.size(), kOutputCanary);
+        dout.copy_from_host(canary.data(), canary.size() * sizeof(std::uint16_t));
+        Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
+        Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, tokens});
+        Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, tokens});
+        Tensor tp(dp.data(), DType::I32, {tokens});
+        Tensor ttable_row(dtable_row.data(), DType::I32, {1});
+        Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
+        const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(base + tokens),
+                                                 static_cast<std::uint32_t>(base + tokens)};
+        const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
+            geometry.q_heads, DType::I8, envelope, 1, tokens, tokens);
+        GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+        WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+        ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable_row, kAttentionScale, cache.batch_view(),
+                           envelope, workspace, tout, nullptr);
+        cuda_synchronize();
+        const std::vector<std::uint16_t> bits = copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+        const std::vector<double> actual = bf16_bits_to_double(bits);
+
+        long double sq_err = 0, sq_ref = 0;
+        for (std::size_t i = 0; i < actual.size(); ++i) {
+            const double d = actual[i] - reference[i];
+            sq_err += static_cast<long double>(d * d);
+            sq_ref += static_cast<long double>(reference[i] * reference[i]);
+        }
+        const double rel_l2  = std::sqrt(static_cast<double>(sq_err / static_cast<long double>(actual.size())));
+        const double ref_rms = std::sqrt(static_cast<double>(sq_ref / static_cast<long double>(actual.size())));
+        const double ratio   = ref_rms > 0 ? rel_l2 / ref_rms : 0.0;
+        const std::string label = std::string("gqa_attention_outlier ") + geometry.name + " T=" +
+                                  std::to_string(tokens) + " dims=" + std::to_string(kOutlierDims);
+        if (ratio > kRelBound) {
+            std::cerr << label << ": outlier-channel INT8 attention rel_l2/ref_rms " << ratio
+                      << " exceeds " << kRelBound << " (rotation benefit lost)\n";
+            ++failures;
+        } else {
+            std::cout << "ok      " << label << " (rel_l2/ref_rms " << ratio << " <= " << kRelBound
+                      << ")\n";
+        }
+    }
+    return failures;
+}
+
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -560,6 +675,7 @@ int main() {
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_int8_split_policy_cases();
     failures += run_batch_cases();
+    failures += run_outlier_regression_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " gqa_attention public-contract correctness\n";
     return failures == 0 ? 0 : 1;

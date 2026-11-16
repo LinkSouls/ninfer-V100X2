@@ -539,6 +539,32 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     };
     if (cache.dtype == DType::I8) {
         launch_for_dtype.template operator()<true>();
+        // Undo the INT8 KV value rotation on the combined output. The reduce kernel above works in
+        // the rotated-V coordinates; this one-time transform (see the kernel's comment) restores
+        // the un-rotated attention output. BF16 needs no inverse (its V was never rotated).
+        const dim3 inv_grid(Geometry::QHeads, invocation.width * invocation.batch_size);
+        const auto launch_inverse = [&]<bool MultiBatch, bool Masked, bool Offset>() {
+            gqa_attention_small_t_inverse_rotate_kernel<Geometry, MultiBatch, Masked, Offset>
+                <<<inv_grid, 256, 0, stream>>>(
+                    static_cast<const std::int32_t*>(pos.data),
+                    invocation.valid_columns == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                    invocation.width, invocation.full_width, invocation.column_begin,
+                    invocation.batch_size, static_cast<__nv_bfloat16*>(out.data));
+        };
+        const bool offset = invocation.column_begin != 0;
+        const auto launch_inverse_profile = [&]<bool MultiBatch, bool Masked>() {
+            if (offset) { launch_inverse.template operator()<MultiBatch, Masked, true>(); }
+            else { launch_inverse.template operator()<MultiBatch, Masked, false>(); }
+        };
+        if (invocation.batch_size == 1) {
+            if (masked) { launch_inverse_profile.template operator()<false, true>(); }
+            else { launch_inverse_profile.template operator()<false, false>(); }
+        } else {
+            if (masked) { launch_inverse_profile.template operator()<true, true>(); }
+            else { launch_inverse_profile.template operator()<true, false>(); }
+        }
     } else {
         launch_for_dtype.template operator()<false>();
     }

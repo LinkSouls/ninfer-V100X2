@@ -69,6 +69,7 @@
 #include "ops/common/volta_mma.cuh"
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
+#include "ops/kernel/hadamard_d256.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -259,15 +260,12 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
     }
 
     if constexpr (CacheInput::writes_cache) {
-        // Quantize this tile's new rows into the cache before any of it is staged back out.
-        // One warp owns one (token, 64-group) pair so that the absmax reduction that sets the
-        // group's scale is exactly a full-warp reduction: 32 lanes x 2 elements = 64 = one
-        // group. This mirrors the SIMT kernel's append block (gqa_attention_decode_i8.cuh);
-        // the codes have to come out bit-identical, since the two kernels share a cache.
+        // Quantize this tile's new rows into the cache before any of it is staged back out. One
+        // warp owns the full D256 row (lane l holds dims l + 32*r); rotate K and V in registers,
+        // then quantize all four 64-groups. The codes must come out bit-identical to the SIMT
+        // kernel's append block (gqa_attention_decode_i8.cuh), since the two share a cache.
         const int warps = Threads / 32;
-        for (int pair = warp; pair < valid_tokens * Groups; pair += warps) {
-            const int token    = pair / Groups;
-            const int grp      = pair - token * Groups;
+        for (int token = warp; token < valid_tokens; token += warps) {
             const int position = pos[token];
             if (position < split_start || position >= split_end || position < 0 ||
                 position >= logical_capacity) {
@@ -276,35 +274,44 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
             int physical_page     = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
             physical_page          = __shfl_sync(FullMask, physical_page, 0);
             const int page_offset = position & kPagedKVPageMask;
-            const int d0          = grp * kGqaKvQuantGroup + lane;
-            const int d1          = d0 + 32;
-            const std::int64_t src0 = gqa_kv_new_index<Geometry>(kv_head, d0, token);
-            const std::int64_t src1 = gqa_kv_new_index<Geometry>(kv_head, d1, token);
-            const float kv0         = __bfloat162float(input.k[src0]);
-            const float kv1         = __bfloat162float(input.k[src1]);
-            const float vv0         = __bfloat162float(input.v[src0]);
-            const float vv1         = __bfloat162float(input.v[src1]);
-            float kamax             = fmaxf(fabsf(kv0), fabsf(kv1));
-            float vamax             = fmaxf(fabsf(vv0), fabsf(vv1));
-            kamax                   = warp_max(kamax, FullMask);
-            vamax                   = warp_max(vamax, FullMask);
-            const __half ksh        = __float2half_rn(kamax > 0.0f ? kamax / 127.0f : 0.0f);
-            const __half vsh        = __float2half_rn(vamax > 0.0f ? vamax / 127.0f : 0.0f);
-            const float k_inv       = __half2float(ksh) > 0.0f ? 1.0f / __half2float(ksh) : 0.0f;
-            const float v_inv       = __half2float(vsh) > 0.0f ? 1.0f / __half2float(vsh) : 0.0f;
-            cache_k_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d0, page_offset)] =
-                gqa_kv_quant_code(kv0, k_inv);
-            cache_k_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d1, page_offset)] =
-                gqa_kv_quant_code(kv1, k_inv);
-            cache_v_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d0, page_offset)] =
-                gqa_kv_quant_code(vv0, v_inv);
-            cache_v_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d1, page_offset)] =
-                gqa_kv_quant_code(vv1, v_inv);
-            if (lane == 0) {
-                const std::int64_t so =
-                    gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, grp, page_offset);
-                cache_k_scale[so] = ksh;
-                cache_v_scale[so] = vsh;
+            float k_vals[8] = {}, v_vals[8] = {};
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int d    = lane + 32 * r;
+                const auto src = gqa_kv_new_index<Geometry>(kv_head, d, token);
+                k_vals[r]      = __bfloat162float(input.k[src]);
+                v_vals[r]      = __bfloat162float(input.v[src]);
+            }
+            gqa_hadamard_d256_inplace(k_vals, lane);
+            gqa_hadamard_d256_inplace(v_vals, lane);
+#pragma unroll
+            for (int grp = 0; grp < Groups; ++grp) {
+                const int d0   = grp * kGqaKvQuantGroup + lane;
+                const int d1   = d0 + 32;
+                const float kv0 = k_vals[2 * grp];
+                const float kv1 = k_vals[2 * grp + 1];
+                const float vv0 = v_vals[2 * grp];
+                const float vv1 = v_vals[2 * grp + 1];
+                float kamax     = warp_max(fmaxf(fabsf(kv0), fabsf(kv1)), FullMask);
+                float vamax     = warp_max(fmaxf(fabsf(vv0), fabsf(vv1)), FullMask);
+                const __half ksh  = __float2half_rn(kamax > 0.0f ? kamax / 127.0f : 0.0f);
+                const __half vsh  = __float2half_rn(vamax > 0.0f ? vamax / 127.0f : 0.0f);
+                const float k_inv  = __half2float(ksh) > 0.0f ? 1.0f / __half2float(ksh) : 0.0f;
+                const float v_inv  = __half2float(vsh) > 0.0f ? 1.0f / __half2float(vsh) : 0.0f;
+                cache_k_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d0, page_offset)] =
+                    gqa_kv_quant_code(kv0, k_inv);
+                cache_k_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d1, page_offset)] =
+                    gqa_kv_quant_code(kv1, k_inv);
+                cache_v_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d0, page_offset)] =
+                    gqa_kv_quant_code(vv0, v_inv);
+                cache_v_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d1, page_offset)] =
+                    gqa_kv_quant_code(vv1, v_inv);
+                if (lane == 0) {
+                    const std::int64_t so =
+                        gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, grp, page_offset);
+                    cache_k_scale[so] = ksh;
+                    cache_v_scale[so] = vsh;
+                }
             }
         }
         __syncthreads();
@@ -316,19 +323,30 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
     for (int row_base = 0; row_base < row_count; row_base += Br) {
         const int rows_here = (row_count - row_base < Br) ? (row_count - row_base) : Br;
 
-        for (int idx = tid; idx < Br * D; idx += Threads) {
-            const int row = idx / D;
-            const int d   = idx - row * D;
-            int q_head     = 0;
-            int token      = 0;
-            __nv_bfloat16 value = __float2bfloat16(0.0f);
-            if (row < rows_here) {
+        // Stage Q into the shared tile, rotating each D256 row in registers so the Q side carries
+        // the same Hadamard coordinates as the (rotated) K (see hadamard_d256.cuh). One warp owns
+        // one row (lane l holds dims l + 32*r); invalid rows are zeroed as before.
+        {
+            const int warps = Threads / 32;
+            for (int row = warp; row < Br; row += warps) {
+                int q_head = 0;
+                int token  = 0;
                 gqa_small_t_tc_row_to_qt<Geometry>(row_base + row, tokens, kv_head, q_head, token);
-                if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
-                    value = q[gqa_q_index<Geometry>(q_head, d, token)];
+                float q_vals[8] = {};
+                if (row < rows_here && gqa_valid_q_head<Geometry>(kv_head, q_head)) {
+#pragma unroll
+                    for (int r = 0; r < 8; ++r) {
+                        const int d = lane + 32 * r;
+                        q_vals[r]   = __bfloat162float(q[gqa_q_index<Geometry>(q_head, d, token)]);
+                    }
+                }
+                gqa_hadamard_d256_inplace(q_vals, lane);
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    const int d = lane + 32 * r;
+                    q_s[row * SmemStride + d] = __float2half(q_vals[r]);
                 }
             }
-            q_s[row * SmemStride + d] = __float2half(__bfloat162float(value));
         }
         __syncthreads();
 

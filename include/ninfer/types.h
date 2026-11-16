@@ -28,6 +28,9 @@ inline constexpr std::uint32_t kMaximumVisionTokenBudget = 32768;
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
+    Fp8E4M3Group64, // E4M3 code + per-64-group FP16 scale
+    Nvfp4Group16,   // E2M1 code (2 per byte) + per-16-group E4M3 scale
+    Fp8KeyNvfp4Value, // key plane uses FP8 E4M3, value plane uses NVFP4 group-16
 };
 
 enum class KvCapacityMode : std::uint8_t {

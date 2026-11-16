@@ -10,6 +10,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/gqa_attention_geometry.cuh"
+#include "ops/kernel/hadamard_d256.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ninfer/ops/gqa_attention.h"
 
@@ -441,6 +442,66 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     }
     const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
     out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+}
+
+// One-time output-side undo of the INT8 KV value rotation. The INT8 partial + reduce kernels work
+// in the rotated-V coordinates (V was rotated before quantization), so the combined, normalized
+// output row must be inverse-rotated before it is exposed. This runs once per (head, token) after
+// the split reduce, in a separate tiny kernel: the reduce kernel is deliberately left in its
+// tuned 32-dim-chunk form (so the BF16 path stays bit-identical), and the inverse is a one-time
+// transform on the final output tensor -- not a KV quantize/dequant kernel, so it does not touch
+// the halved-bandwidth fusion the design protects. A warp reads the full D256 row, applies the
+// same (self-inverse) Hadamard transform, and writes it back.
+template <typename Geometry, bool MultiBatch, bool Masked, bool Offset>
+__launch_bounds__(256) __global__ void gqa_attention_small_t_inverse_rotate_kernel(
+    const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
+    std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
+    __nv_bfloat16* out) {
+    const int q_head      = static_cast<int>(blockIdx.x);
+    const int flat_column = static_cast<int>(blockIdx.y);
+    int batch             = 0;
+    int token             = flat_column;
+    if constexpr (MultiBatch) {
+        batch = flat_column / tokens;
+        token = flat_column - batch * tokens;
+    }
+    if (q_head >= Geometry::QHeads || token >= tokens) { return; }
+    if constexpr (MultiBatch) {
+        if (batch >= batch_size) { return; }
+    }
+    if constexpr (Offset) { positions += column_begin; }
+    if constexpr (MultiBatch) { positions += batch * full_width; }
+    int output_column = token;
+    if constexpr (Offset) { output_column += column_begin; }
+    if constexpr (MultiBatch) { output_column += batch * full_width; }
+    (void)positions;
+    if constexpr (Masked) {
+        // The mask is per-request: valid_columns[batch] bounds the WITHIN-request column
+        // (token + column_begin), NOT the absolute output_column which carries the
+        // batch * full_width offset. Comparing the absolute column would skip every
+        // batched request with batch >= 1 (leaving its output in the rotated-V
+        // coordinates), so use the within-request column here.
+        int mask_column = token;
+        if constexpr (Offset) { mask_column += column_begin; }
+        if (mask_column >= valid_columns[batch]) { return; }
+    }
+
+    __shared__ float row_s[kGqaHeadDim];
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    row_s[tid]     = __bfloat162float(out[gqa_q_index<Geometry>(q_head, tid, output_column)]);
+    __syncthreads();
+    if (warp == 0) {
+        float values[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) { values[r] = row_s[lane + 32 * r]; }
+        gqa_hadamard_d256_inplace(values, lane);
+#pragma unroll
+        for (int r = 0; r < 8; ++r) { row_s[lane + 32 * r] = values[r]; }
+    }
+    __syncthreads();
+    out[gqa_q_index<Geometry>(q_head, tid, output_column)] = __float2bfloat16(row_s[tid]);
 }
 
 } // namespace ninfer::ops
