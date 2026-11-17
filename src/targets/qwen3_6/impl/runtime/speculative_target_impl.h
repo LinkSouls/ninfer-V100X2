@@ -17,12 +17,12 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
                                  frame.target_hidden, frame.target_logits, frame.target_tokens,
-                                 *frame.feature_sink, greedy_target);
+                                 *frame.feature_sink, frame.target_masks, greedy_target);
     } else {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
                                  frame.target_hidden, frame.target_logits, frame.target_tokens,
-                                 greedy_target);
+                                 frame.target_masks, greedy_target);
     }
     if (greedy_target) {
         ops::speculative_accept_greedy_tokens(
@@ -70,12 +70,13 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     const auto hidden = field(&TargetVerifyFrameView::target_hidden);
     const auto logits = field(&TargetVerifyFrameView::target_logits);
     const auto tokens = field(&TargetVerifyFrameView::target_tokens);
+    const auto masks  = field(&TargetVerifyFrameView::target_masks);
     if (frame.feature_sink != nullptr) {
         card.target_verify_batch(ids, positions, rope, valid, rows, lanes, envelope,
-                                 hidden, logits, tokens, *frame.feature_sink, greedy_target);
+                                 hidden, logits, tokens, *frame.feature_sink, masks, greedy_target);
     } else {
         card.target_verify_batch(ids, positions, rope, valid, rows, lanes, envelope,
-                                 hidden, logits, tokens, greedy_target);
+                                 hidden, logits, tokens, masks, greedy_target);
     }
     const auto& ec = *execution.peers[0].execution;
     for_each_rank(ec, [&](int rank) {

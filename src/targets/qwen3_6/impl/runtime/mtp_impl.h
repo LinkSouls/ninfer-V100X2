@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
+#include "targets/qwen3_6/impl/runtime/bridge_dump.h"
 
 #include "ninfer/ops/mtp_round.h"
 #include "ninfer/ops/scatter.h"
@@ -47,6 +48,7 @@ struct MtpRoundView {
     Tensor ar_valid_columns;
     Tensor next_drafts;
     Tensor proposal_logits;
+    Tensor target_masks;
     const ops::SamplingConfig* sampling = nullptr;
 };
 
@@ -106,6 +108,7 @@ TargetVerifyFrameView verify_view(const MtpRoundView& v, const GdnReplayRecords*
         .selected_hidden = v.selected_hidden,
         .replay_records  = records,
         .sampling        = v.sampling,
+        .target_masks    = v.target_masks,
     };
 }
 
@@ -155,6 +158,14 @@ void mtp_bridge_tp2(PrefillContext& state, const Tensor& next_token,
     card.mtp_forward_batch(next_token, restored, positions, rope, {visible, visible}, ar_hidden,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
                            build_proposal ? &draft0 : nullptr, next_embedding);
+    // p9-vision-prefix-bridge-nvfp4: dump the bridge's input/draft hidden and target logits so
+    // the single-step MTP bridge can be diffed against the cold-path MTP alignment at the same
+    // position. Compiles away without the dump macro.
+    if (auto sink = bridge_dump::make_sink("reused")) {
+        bridge_dump::dump_mtp_bridge(sink->dir, sink->label, restored[0], ar_hidden[0],
+                                     build_proposal ? logits[0] : ar_hidden[0], position,
+                                     ec.dev[0]->stream);
+    }
     if (build_proposal) {
         for_each_rank(ec, [&](int rank) {
             ops::set_i32_scalar(ar_positions[rank], position + 1, ec.dev[rank]->stream);
@@ -239,6 +250,16 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     }
 }
 
+// Per-position output-constraint mask words for the verify step: the frame's mask tensor is
+// [columns * words, batch] with columns == the configured draft window + 1, and the body's
+// `width` (k + 1 with k == the window) equals it, so the per-position word count divides evenly.
+std::int32_t mask_words_per_position(const qwen3_6::MtpDecodeState& frame, std::int32_t width) {
+    if (width <= 0 || frame.mask_words.ne[0] % width != 0) {
+        throw std::logic_error("MTP decode mask width is not a multiple of the verify width");
+    }
+    return frame.mask_words.ne[0] / width;
+}
+
 auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                            MtpGqaEnvelopes envelopes) {
     return [&state, batch_size, k, envelopes] {
@@ -273,6 +294,45 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         card.set_volta_long_attention(state.execution.volta_long_attention);
 
         MtpRoundView v = slice_mtp_frame(frame, batch_size);
+
+        // Output-constraint staging: upload this round's per-(row, position) mask words to the
+        // frame (and to each peer's frame) before target verification. Unconstrained rows carry
+        // all-ones words (a bit-identical no-op), so the mask op runs unconditionally and the
+        // captured graph structure stays invariant. The pinned staging buffers outlive every
+        // graph, the same contract as the ingress upload above.
+        if (state.token_mask_words == nullptr) {
+            throw std::logic_error("MTP decode batch is missing its mask-word staging");
+        }
+        std::array<Tensor, kMaximumExecutionDevices> rank_masks{};
+        const std::int32_t mask_words = mask_words_per_position(frame, width);
+        {
+            Tensor mask_view = frame.mask_words.slice(1, 0, batch_size);
+            CUDA_CHECK(cudaMemcpyAsync(mask_view.data, state.token_mask_words,
+                                       static_cast<std::size_t>(batch_size) *
+                                           static_cast<std::size_t>(width) *
+                                           static_cast<std::size_t>(mask_words) *
+                                           sizeof(std::uint32_t),
+                                       cudaMemcpyHostToDevice, state.execution.device.stream));
+            rank_masks[0] = Tensor(mask_view.data, DType::I32,
+                                   {batch_size * width, mask_words, 1, 1});
+            v.target_masks = rank_masks[0];
+        }
+        for (std::size_t index = 0; index < state.execution.peers.size(); ++index) {
+            const auto& peer = state.execution.peers[index];
+            if (peer.mtp_mask_words == nullptr) {
+                throw std::logic_error("parallel MTP decode requires peer mask-word staging");
+            }
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(peer.device->device));
+            Tensor peer_mask_view = peer.io->mtp_decode->mask_words.slice(1, 0, batch_size);
+            CUDA_CHECK(cudaMemcpyAsync(
+                peer_mask_view.data, peer.mtp_mask_words,
+                static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(width) *
+                    static_cast<std::size_t>(mask_words) * sizeof(std::uint32_t),
+                cudaMemcpyHostToDevice, peer.device->stream));
+            rank_masks[index + 1] =
+                Tensor(peer_mask_view.data, DType::I32, {batch_size * width, mask_words, 1, 1});
+        }
 
         if (state.execution.peers.empty()) {
             ops::speculative_prepare_verify_inputs(v.anchors, v.current_drafts, v.frontiers,
@@ -320,6 +380,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             auto views = rank_views(state.execution, [&](int rank) {
                 return rank == 0 ? v : slice_mtp_frame(*tp[rank - 1].io->mtp_decode, batch_size);
             });
+            for (std::size_t index = 0; index <= state.execution.peers.size(); ++index) {
+                views[index].target_masks = rank_masks[index];
+            }
             const auto field = [&](Tensor MtpRoundView::* member) {
                 return rank_views(state.execution, [&](int rank) { return views[rank].*member; });
             };

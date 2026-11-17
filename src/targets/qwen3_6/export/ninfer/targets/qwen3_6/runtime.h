@@ -17,6 +17,8 @@ struct ExecutionContext;
 
 namespace ninfer::targets::qwen3_6 {
 
+class OutputSession;
+
 enum class TextPhase {
     Prefill,
     Verify,
@@ -164,7 +166,9 @@ public:
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPrompt&& prompt,
                                                                 RequestPlan<Variant>&& plan,
-                                                                runtime::TransientRegion transient);
+                                                                runtime::TransientRegion transient,
+                                                                const OutputSession* output_session =
+                                                                    nullptr);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
@@ -180,6 +184,8 @@ public:
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     // Borrowed worker-owned counters; valid until the next mutation of this lane.
     [[nodiscard]] const SpeculativeStats& speculative_stats_lane(std::uint32_t lane) const noexcept;
+    // The instance's speculative decode backend (None | Mtp | DFlash), fixed at startup.
+    [[nodiscard]] SpeculativeBackend speculative_backend() const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;

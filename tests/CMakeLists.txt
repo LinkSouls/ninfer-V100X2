@@ -387,6 +387,7 @@ set(ninfer_op_tests
   sampling
   scalar
   cast
+  token_mask
   scatter
   position)
 foreach(op IN LISTS ninfer_op_tests)
@@ -634,6 +635,10 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
+
+ninfer_add_test(ninfer_grammar_test
+  SOURCES test_grammar.cpp
+  LIBRARIES ninfer_grammar)
 
 # Apply after all registrations, including aliases with their own ENVIRONMENT property.
 # CUDA performs physical-to-logical ordinal mapping for every test and its child processes.

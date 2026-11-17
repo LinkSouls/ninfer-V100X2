@@ -211,6 +211,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.round = qwen3_6::begin_round_state_layout(
         builder, qwen3_6::RoundStateSpec{.hidden         = TextConfig::hidden,
                                          .output_rows    = TextConfig::output_rows,
+                                         .mask_words     = (TextConfig::output_rows + 31) / 32,
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
                                          .gdn_record_norm_heads =

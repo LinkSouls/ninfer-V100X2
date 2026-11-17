@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
+#include "targets/qwen3_6/impl/runtime/bridge_dump.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 
 #include "core/arena.h"
@@ -241,6 +242,12 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    // Host-staged output-constraint mask words for the prefill's bonus (first generated) token:
+    // one position, kPhysicalMaskWords uint32 words (the physical-vocabulary width). Null for
+    // unconstrained lanes, which stay on the untouched bit-identical path. Applied to the prefill
+    // bonus logits before sampling in prefill_impl / prefill_impl_tp2.
+    void set_prefill_token_mask(const std::uint32_t* words) noexcept { prefill_token_mask_ = words; }
+
     void set_linear_state_slots(std::int32_t current_slot, std::int32_t rewrite_checkpoint_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
@@ -271,13 +278,14 @@ public:
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
-                             Tensor& target_tokens, bool greedy_target = false);
+                             Tensor& target_tokens, const Tensor& target_masks = Tensor{},
+                             bool greedy_target = false);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
                              Tensor& target_tokens, DFlashFeatureSink& sink,
-                             bool greedy_target = false);
+                             const Tensor& target_masks = Tensor{}, bool greedy_target = false);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -317,6 +325,7 @@ public:
                              const std::array<Tensor, kMaximumExecutionDevices>& hidden,
                              const std::array<Tensor, kMaximumExecutionDevices>& logits,
                              const std::array<Tensor, kMaximumExecutionDevices>& target_tokens,
+                             const std::array<Tensor, kMaximumExecutionDevices>& target_masks = {},
                              bool greedy_target = false);
     void target_verify_batch(const std::array<Tensor, kMaximumExecutionDevices>& ids,
                              const std::array<Tensor, kMaximumExecutionDevices>& cache_positions,
@@ -328,7 +337,9 @@ public:
                              const std::array<Tensor, kMaximumExecutionDevices>& hidden,
                              const std::array<Tensor, kMaximumExecutionDevices>& logits,
                              const std::array<Tensor, kMaximumExecutionDevices>& target_tokens,
-                             DFlashFeatureSink& sink, bool greedy_target = false);
+                             DFlashFeatureSink& sink,
+                             const std::array<Tensor, kMaximumExecutionDevices>& target_masks = {},
+                             bool greedy_target = false);
     // Greedy TP2 verification can reduce each vocabulary shard to one exact (value, id) winner,
     // exchange two tiny [1,T] tensors, and merge them. This avoids the full [V,T] all-gather; the
     // full-logit overload above remains the route for temperature/penalty sampling.
@@ -440,7 +451,8 @@ private:
                        const ops::ReplicatedRmsNorm* next_input_norm = nullptr);
     void run_layers_tp2(std::array<Tensor, kMaximumExecutionDevices>& x, Phase phase,
                         const std::array<Tensor, kMaximumExecutionDevices>& staging,
-                        DFlashFeatureSink* dflash_sink = nullptr);
+                        DFlashFeatureSink* dflash_sink = nullptr,
+                        const bridge_dump::DumpSink* bridge_dump_sink = nullptr);
     // Vocabulary-split head: each rank computes its own half of the logits, then one allgather
     // per column leaves the FULL logits on both ranks. Sampling then runs on rank 0 alone.
     void logits_tp2(const std::array<Tensor, kMaximumExecutionDevices>& hidden,
@@ -510,7 +522,8 @@ private:
                                   const Tensor& rope_positions, const Tensor& valid_columns,
                                   const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                   ops::GqaExecutionEnvelope envelope, Tensor& hidden,
-                                  Tensor& logits, Tensor& target_tokens, Tap& tap);
+                                  Tensor& logits, Tensor& target_tokens,
+                                  const Tensor& target_masks, Tap& tap);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
@@ -584,6 +597,8 @@ private:
     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
     Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
     std::uint32_t mtp_proposal_extent_                    = 0;
+    // One-position output-constraint mask words for the prefill bonus token; null when unconstrained.
+    const std::uint32_t* prefill_token_mask_               = nullptr;
     std::optional<PeerExecution> pipeline_;
     TokenId* pipeline_upload_ = nullptr;
     bool capture_retrieval_query_ = true;

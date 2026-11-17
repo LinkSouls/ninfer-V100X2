@@ -220,7 +220,10 @@ The endpoint supports:
 - function tools, tool choices, assistant tool-call history, and tool-result messages;
 - the top-level `reasoning_effort` field;
 - the `enable_thinking` extension;
-- `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
+- `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias;
+- structured-output constraints: `response_format` (`json_object` / `json_schema`), the
+  top-level `grammar` / `guided_*` aliases, and `tool_constraints` / `tool_choice` (see
+  [Structured output constraints](#structured-output-constraints)).
 
 The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
 the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
@@ -273,6 +276,86 @@ responses return this field in `usage`; streaming clients must request
 
 The token cache-hit rate for this request is `900 / 1000 = 90%`. It is not the fraction of requests
 with a hit. The Responses API reports the same reuse as `usage.input_tokens_details.cached_tokens`.
+
+### Structured output constraints
+
+A request may constrain the generated tokens to a grammar so the model can only emit
+structurally valid output. The constraint is compiled to a per-position token mask; forbidden
+tokens are set to `-inf` in the logits before sampling. This applies to the ordinary decode
+loop, the prefill's first (bonus) token, and the MTP speculative-verification steps. When no
+constraint is present the sampling path is unchanged (bit-identical to an unconstrained build).
+
+There are three ways to express a constraint; at most one may be active per request.
+
+**`response_format`** (OpenAI spelling):
+
+| `type`        | extra field | meaning                                             |
+|---------------|-------------|-----------------------------------------------------|
+| `json_object` | —           | any valid JSON object                                |
+| `json_schema` | `json_schema` | a JSON-Schema object; `json_schema` carries the whitelisted keys `schema` (required object), `name`, `description`, `strict` |
+| `text`        | —           | no constraint                                        |
+
+Any other `response_format` field, any key outside the `json_schema` whitelist, a missing
+`schema`, or an unknown `type` is rejected with HTTP 400 naming the offending path (e.g.
+`response_format.json_schema.bogus`).
+
+**Top-level aliases** (one of, mutually exclusive):
+
+| field            | value                 | meaning                                  |
+|------------------|-----------------------|------------------------------------------|
+| `grammar` / `guided_grammar` | GBNF source string | an explicit grammar |
+| `guided_json`    | JSON-schema string    | `json_schema`; empty string = any JSON object |
+| `guided_regex`   | regex pattern         | a regular expression                    |
+| `guided_choice`  | array of strings      | the output must be exactly one member    |
+
+Two aliases in one request conflict (400), as does an alias together with a structured
+`response_format` (`{type:"text"}` does not conflict).
+
+**Tool-call constraints:** `tool_constraints` (`"auto"` or `"basic"`) enables a model-owned
+tool grammar so that a `tool_choice` selection is emitted in the model's native tool-call
+syntax and validated against the declared tool schemas. `tool_choice` takes `"none"`,
+`"auto"`, `"required"`, or a `{"type":"function","function":{"name":...}}` object. `tool_choice`
+requires at least one `tools` entry, a named choice must reference a declared tool, and
+`"required"` with no usable tool is rejected — all with HTTP 400 and the `tool_choice` /
+`tools` param path.
+
+**Error contract.** A request whose constraint cannot be compiled (an unsatisfiable schema, an
+invalid regex/GBNF/choice, …) is rejected with HTTP 400, code `invalid_output_constraint` (or
+`constraint_dead_end` for a grammar with no valid completion), and the param path points at the
+offending schema/grammar location. The service stays up: a subsequent unconstrained request
+completes normally. A constraint on a DFlash speculative backend is rejected at the submission
+boundary with HTTP 400, code `constraint_unsupported_by_backend` (DFlash does not apply output
+constraints); the same request is accepted on an MTP or ordinary backend.
+
+```bash
+# Any JSON object
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"Reply as JSON."}],
+       "response_format":{"type":"json_object"}}'
+
+# A JSON schema (required + enum)
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"Pick a color and a count."}],
+       "response_format":{"type":"json_schema","json_schema":{"strict":true,"schema":{
+         "type":"object","properties":{"color":{"type":"string","enum":["red","green","blue"]},
+                                       "count":{"type":"integer","minimum":1}},
+         "required":["color","count"]}}}}'
+
+# Regex / choice aliases
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"Name a lowercase word."}],
+       "guided_regex":"^[a-z]{3,}$"}'
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"Pick one color."}],
+       "guided_choice":["red","green","blue"]}'
+
+# Constrained tool call (basic tool grammar)
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"What is the weather in Tokyo?"}],
+       "tools":[{"type":"function","function":{"name":"get_weather","parameters":{
+         "type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],
+       "tool_choice":"auto","tool_constraints":"basic"}'
+```
 
 ### Multimodal request
 
@@ -380,7 +463,7 @@ wire response contains typed `output` Items.
 | `reasoning.summary` | optional `auto`, `concise`, `detailed`, or null; accepted/echoed as a client preference. Local Qwen emits raw `reasoning_text` with an empty summary, without a separate summarization pass. |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
-| `text.format` | omitted or `{"type":"text"}` only |
+| `text.format` | omitted, `{"type":"text"}`, `{"type":"json_object"}`, or `{"type":"json_schema","json_schema":{...}}`; the last carries the same `schema`/`name`/`description`/`strict` whitelist as Chat `response_format` (see [Structured output constraints](#structured-output-constraints)); unknown fields are 400 with a `text.format...` param path |
 | `tools` | flat Responses function definitions; see below |
 | `tool_choice` | `auto` or `none` |
 | `parallel_tool_calls` | omitted or `true` |

@@ -8,6 +8,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <string_view>
 
 namespace ninfer::serve {
 namespace {
@@ -454,14 +455,16 @@ void reject_unsupported_features(const Json& body) {
         std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
                                ? fmt.at("type").get<std::string>()
                                : std::string();
-        if (type != "text") {
+        if (type != "text" && type != "json_object" && type != "json_schema") {
             ApiError error;
-            error.message = "only response_format {type:text} is supported";
-            error.param   = "response_format";
+            error.message = "unsupported response_format type: " + type;
+            error.param   = "response_format.type";
             error.code    = "response_format_not_supported";
             throw ApiException(std::move(error));
         }
     }
+    // Structured-output aliases and tool_constraints are validated in parse_output_constraint
+    // (below), where the combined request state (tools / tool_choice) is available.
 }
 
 Json base_chunk(const std::string& id, const std::string& model, std::int64_t created) {
@@ -539,6 +542,139 @@ void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
     out.reasoning_effort_param = "reasoning_effort";
 }
 
+// Parse structured-output constraints (p7): response_format (json_object / json_schema), the
+// top-level guided_* / grammar aliases, and tool_constraints. Conflicts and unsupported field
+// values are 400 with the offending param path. The result lands in out.constraint and
+// out.tool_constraints; an empty constraint leaves sampling unconstrained.
+void parse_output_constraint(const Json& body, GenerationRequest& out) {
+    // --- response_format ---------------------------------------------------
+    std::optional<ninfer::OutputConstraint> from_response_format;
+    bool response_format_structured = false;
+    if (body.contains("response_format") && !body.at("response_format").is_null()) {
+        const Json& fmt = body.at("response_format");
+        if (!fmt.is_object()) { bad_request("response_format must be an object", "response_format"); }
+        for (auto it = fmt.begin(); it != fmt.end(); ++it) {
+            if (it.key() != "type" && it.key() != "json_schema") {
+                bad_request("response_format has unsupported field: " + it.key(),
+                            "response_format." + it.key());
+            }
+        }
+        if (!fmt.contains("type") || !fmt.at("type").is_string()) {
+            bad_request("response_format.type is required", "response_format.type");
+        }
+        const std::string type = fmt.at("type").get<std::string>();
+        if (type == "json_object") {
+            if (fmt.contains("json_schema")) {
+                bad_request("response_format json_object must not carry a json_schema field",
+                            "response_format.json_schema");
+            }
+            from_response_format = ninfer::OutputConstraint::json_object();
+            response_format_structured = true;
+        } else if (type == "json_schema") {
+            if (!fmt.contains("json_schema") || !fmt.at("json_schema").is_object()) {
+                bad_request("response_format json_schema requires a json_schema object",
+                            "response_format.json_schema");
+            }
+            const Json& spec = fmt.at("json_schema");
+            for (auto it = spec.begin(); it != spec.end(); ++it) {
+                if (it.key() != "schema" && it.key() != "name" && it.key() != "description" &&
+                    it.key() != "strict") {
+                    bad_request("response_format.json_schema has unsupported field: " + it.key(),
+                                "response_format.json_schema." + it.key());
+                }
+            }
+            if (!spec.contains("schema") || !spec.at("schema").is_object()) {
+                bad_request("response_format.json_schema.schema is required and must be an object",
+                            "response_format.json_schema.schema");
+            }
+            if (spec.contains("name") && !spec.at("name").is_string()) {
+                bad_request("response_format.json_schema.name must be a string",
+                            "response_format.json_schema.name");
+            }
+            if (spec.contains("description") && !spec.at("description").is_string()) {
+                bad_request("response_format.json_schema.description must be a string",
+                            "response_format.json_schema.description");
+            }
+            if (spec.contains("strict") && !spec.at("strict").is_boolean()) {
+                bad_request("response_format.json_schema.strict must be a boolean",
+                            "response_format.json_schema.strict");
+            }
+            from_response_format = ninfer::OutputConstraint::json_schema(spec.at("schema").dump());
+            response_format_structured = true;
+        }
+        // type == "text": no constraint.
+    }
+
+    // --- top-level aliases -------------------------------------------------
+    // grammar / guided_grammar: GBNF source string; guided_json: JSON schema string
+    // (empty = any JSON object); guided_regex: pattern; guided_choice: string array.
+    // Multiple aliases in one request conflict.
+    std::optional<ninfer::OutputConstraint> from_alias;
+    std::vector<const char*> present_aliases;
+    for (const char* key :
+         {"grammar", "guided_grammar", "guided_json", "guided_regex", "guided_choice"}) {
+        if (body.contains(key) && !body.at(key).is_null()) { present_aliases.push_back(key); }
+    }
+    if (present_aliases.size() > 1) {
+        bad_request(std::string("structured-output alias ") + present_aliases[1] +
+                        " conflicts with " + present_aliases[0],
+                    present_aliases[1]);
+    }
+    if (present_aliases.size() == 1) {
+        const char* key = present_aliases[0];
+        const auto alias_string = [&](const char* k) -> std::string {
+            const Json& v = body.at(k);
+            if (!v.is_string()) { bad_request(std::string(k) + " must be a string", k); }
+            return v.get<std::string>();
+        };
+        if (std::string_view(key) == "grammar" || std::string_view(key) == "guided_grammar") {
+            from_alias = ninfer::OutputConstraint::grammar(alias_string(key));
+        } else if (std::string_view(key) == "guided_json") {
+            const std::string schema = alias_string(key);
+            if (schema.empty()) {
+                from_alias = ninfer::OutputConstraint::json_object();
+            } else {
+                const Json parsed = Json::parse(schema, nullptr, false);
+                if (parsed.is_discarded() || !parsed.is_object()) {
+                    bad_request("guided_json must be a JSON object schema string", key);
+                }
+                from_alias = ninfer::OutputConstraint::json_schema(schema);
+            }
+        } else if (std::string_view(key) == "guided_regex") {
+            from_alias = ninfer::OutputConstraint::regex(alias_string(key));
+        } else {
+            const Json& v = body.at(key);
+            if (!v.is_array()) { bad_request("guided_choice must be an array of strings", key); }
+            std::vector<std::string> choices;
+            for (const auto& c : v) {
+                if (!c.is_string()) { bad_request("guided_choice entries must be strings", key); }
+                choices.push_back(c.get<std::string>());
+            }
+            from_alias = ninfer::OutputConstraint::choice(std::move(choices));
+        }
+    }
+
+    // A structured-output alias conflicts with a structured response_format; a
+    // {type:"text"} response_format carries no constraint and does not conflict.
+    if (from_alias && response_format_structured) {
+        bad_request("structured-output alias conflicts with response_format", present_aliases[0]);
+    }
+
+    // --- tool_constraints + tool_choice ------------------------------------
+    if (body.contains("tool_constraints") && !body.at("tool_constraints").is_null()) {
+        const Json& tc = body.at("tool_constraints");
+        if (!tc.is_string()) { bad_request("tool_constraints must be a string", "tool_constraints"); }
+        const std::string value = tc.get<std::string>();
+        if (value != "auto" && value != "basic") {
+            bad_request("tool_constraints must be 'auto' or 'basic'", "tool_constraints");
+        }
+        // 'required' with no usable tool is already rejected by parse_tool_choice.
+        out.tool_constraints = value;
+    }
+
+    out.constraint = from_alias ? from_alias : from_response_format;
+}
+
 GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body);
     reject_unsupported_features(body);
@@ -552,6 +688,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
 
     parse_tools(body, out);
     parse_tool_choice(body, out);
+    parse_output_constraint(body, out);
     parse_messages(body, out);
     parse_stop(body, out);
     parse_sampling(body, out);

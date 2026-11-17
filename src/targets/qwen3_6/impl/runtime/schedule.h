@@ -78,6 +78,9 @@ struct PeerCore {
     const qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     const qwen3_6::MtpDecodeIngress* mtp_host_ingress = nullptr;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
+    // Rank 1's pinned mirror of rank 0's MTP mask-word staging (published with the MTP ingress;
+    // the masks depend only on the mirrored drafts, so the bytes are identical).
+    const std::uint32_t* mtp_mask_words = nullptr;
     // Enrolls rank 1's stream in rank 0's capture. Null when graphs are disabled; the eager path
     // never reads it.
     const DecodeGraphPeerBridge* graph_bridge = nullptr;
@@ -159,6 +162,9 @@ struct PrefillContext {
     DFlashPersistentState* dflash;
     std::uint32_t text_kv_base;
     const ops::SamplingConfig* sampling;
+    // Host-staged output-constraint mask words for this lane's next sampled token (one
+    // position, ceil(kTokenDomain/32) uint32 words); null when the lane is unconstrained.
+    const std::uint32_t* token_mask_words = nullptr;
     Tensor* rewrite_checkpoint_hidden;
     std::int32_t current_state_slot                         = 0;
     std::int32_t rewrite_checkpoint_state_slot              = 0;
@@ -175,6 +181,11 @@ struct OrdinaryBatchContext {
     const qwen3_6::OrdinaryDecodeIngress& host_ingress;
     qwen3_6::OrdinaryDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Host-staged output-constraint mask words: one row of ceil(kTokenDomain/32) uint32 words per
+    // compact batch row, in a program-owned pinned buffer that outlives every captured graph.
+    // Unconstrained rows are all-ones (a bit-identical no-op), so the mask op runs
+    // unconditionally inside the graph. Must stay non-null once graphs are captured.
+    const std::uint32_t* token_mask_words = nullptr;
     // Rank 1's own pinned copy of `host_ingress`, with every row's sampling counter pointer
     // nulled (ProgramImplCore::publish_peer_ordinary_ingress). Required whenever
     // `execution.device_count` is engaged; null at tp1.
@@ -189,6 +200,12 @@ struct MtpBatchContext {
     qwen3_6::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
     bool greedy_target = false;
+    // Host-staged output-constraint mask words for the (k+1) verify positions: one
+    // (kMtpDecodeMaximumWidth * ceil(kTokenDomain/32)) uint32 block per compact row, in a
+    // program-owned pinned buffer that outlives every captured graph. Unconstrained rows are
+    // all-ones (a bit-identical no-op), so the mask op runs unconditionally inside the graph.
+    // Must stay non-null once graphs are captured.
+    const std::uint32_t* token_mask_words = nullptr;
 };
 
 struct DFlashBatchContext {
@@ -240,6 +257,9 @@ struct TargetVerifyFrameView {
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
+    // Per-(lane, verify position) output-constraint mask words, [batch * width,
+    // kTokenMaskWords]; empty (null data) when no lane is constrained.
+    Tensor target_masks;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,

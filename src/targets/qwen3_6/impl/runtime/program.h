@@ -233,6 +233,10 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
+    // The executor-owned output session for this lane, bound at admission. Non-null only when the
+    // request carries an output constraint; the program reads its per-position mask words during
+    // the round and never owns it (the session outlives the lane's program state).
+    const qwen3_6::OutputSession* output_session = nullptr;
 
     // Exact-hit output selection needs only the lane's saved tail hidden. Restore the
     // recurrent state and rebuild MTP continuation when decode first consumes them.
@@ -299,6 +303,10 @@ struct PeerRuntime {
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     std::optional<PinnedHostBuffer> mtp_host;
     qwen3_6::MtpDecodeIngress* mtp_host_ingress = nullptr;
+    // Rank 1's pinned mirror of rank 0's MTP mask-word staging. The masks depend only on the
+    // mirrored drafts, so the bytes are identical; published with the MTP ingress.
+    std::optional<PinnedHostBuffer> mtp_mask_host;
+    std::uint32_t* mtp_mask_words = nullptr;
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
 };
@@ -323,7 +331,9 @@ public:
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPromptData&& prompt,
                                                                 RequestPlan&& plan,
-                                                                runtime::TransientRegion transient);
+                                                                runtime::TransientRegion transient,
+                                                                const qwen3_6::OutputSession* output_session =
+                                                                    nullptr);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
@@ -338,6 +348,7 @@ public:
     void evict_retained_lane(std::uint32_t lane);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] const SpeculativeStats& speculative_stats_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] SpeculativeBackend speculative_backend() const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
@@ -359,7 +370,7 @@ public:
     const std::uint32_t draft_window;
     const RamKvOptions ram_kv;
     const bool volta_long_attention;
-    const SpeculativeBackend speculative_backend;
+    const SpeculativeBackend speculative_backend_;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
     const ProposalHead proposal_head;
@@ -451,6 +462,16 @@ public:
     // engine -- concurrent lanes would overwrite it out of order.
     std::vector<std::uint16_t> logits_capture;
     bool logits_capture_enabled = false;
+    // Output-constraint mask-word staging: one ceil(kTokenDomain/32) uint32 row per compact batch
+    // row for the ordinary round (indexed by row, matching the ingress), one
+    // (kMtpDecodeMaximumWidth * ceil(kTokenDomain/32)) block per lane for the MTP verify round.
+    // Pinned so the CUDA-graph decode body can upload it, in a buffer that outlives every graph.
+    // Filled on the host from the lane's output session just before the round; unconstrained
+    // rows are all-ones (a bit-identical no-op for the mask op), so unconstrained requests stay
+    // bit-identical and the decode body can run the mask op unconditionally inside the graph.
+    std::optional<PinnedHostBuffer> mask_words_host;
+    std::uint32_t* ordinary_mask_words = nullptr;
+    std::uint32_t* mtp_mask_words      = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     qwen3_6::OrdinaryDecodeEgress* ordinary_host_egress   = nullptr;

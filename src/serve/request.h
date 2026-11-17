@@ -196,6 +196,14 @@ struct GenerationRequest {
     bool preserve_thinking_semantic_change = false;
     SamplingParams sampling;
 
+    // Structured-output constraint (p7): set by the wire layer from `response_format`
+    // (json_object / json_schema) or a top-level guided_* / grammar alias. Empty leaves sampling
+    // unconstrained and bit-identical to the pre-constraint behavior.
+    std::optional<ninfer::OutputConstraint> constraint;
+    // "auto" | "basic" | "" (off): constrained tool-calling mode. Validated against `tools` and
+    // `tool_choice` at the wire boundary; the model-owned tool grammar (task 3.4) consumes it.
+    std::string tool_constraints;
+
     // Number of Anthropic `tool_reference` blocks that were degraded to empty tool results.
     // A request-level property (not per-turn): it records how many placeholder blocks the
     // client sent, so the request log can show that the client used a deferred-tool path.

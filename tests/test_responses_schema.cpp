@@ -627,6 +627,106 @@ int test_output_token_cap() {
     return failures;
 }
 
+int test_text_format() {
+    using Kind = ninfer::OutputConstraintKind;
+    const Json base = {{"model", "m"}, {"input", "hello"}};
+    int failures = 0;
+
+    // Absent `text` and {type:"text"} leave sampling unconstrained.
+    {
+        auto out = parse_responses_request(base, limits());
+        failures += check(!out.generation.constraint, "absent text leaves sampling unconstrained");
+        Json b = base;
+        b["text"] = Json{{"format", Json{{"type", "text"}}}};
+        out = parse_responses_request(b, limits());
+        failures += check(!out.generation.constraint, "text.format text leaves it unconstrained");
+    }
+
+    // json_object maps to a JsonObject constraint.
+    {
+        Json b = base;
+        b["text"] = Json{{"format", Json{{"type", "json_object"}}}};
+        const auto out = parse_responses_request(b, limits());
+        failures += check(out.generation.constraint &&
+                              out.generation.constraint->kind == Kind::JsonObject,
+                          "text.format json_object -> JsonObject constraint");
+    }
+
+    // json_schema with optional typed fields maps to a JsonSchema constraint.
+    {
+        Json b = base;
+        b["text"] = Json{{"format", Json{{"type", "json_schema"},
+                                         {"schema", Json{{"type", "object"}}},
+                                         {"name", "person"},
+                                         {"description", "a person"},
+                                         {"strict", true}}}};
+        const auto out = parse_responses_request(b, limits());
+        failures += check(out.generation.constraint &&
+                              out.generation.constraint->kind == Kind::JsonSchema,
+                          "text.format json_schema -> JsonSchema constraint");
+        failures += check(out.generation.constraint &&
+                              out.generation.constraint->source.find("\"type\"") !=
+                                  std::string::npos,
+                          "text.format schema serialized into the constraint source");
+    }
+
+    // Unsupported type value -> 400 with the text.format.type param path.
+    {
+        Json b = base;
+        b["text"] = Json{{"format", Json{{"type", "foo"}}}};
+        bool rejected = false;
+        try {
+            (void)parse_responses_request(b, limits());
+        } catch (const ApiException& error) {
+            rejected = error.error().param == "text.format.type" &&
+                       error.error().code == "structured_outputs_not_supported";
+        }
+        failures += check(rejected, "unsupported text.format type rejected with param path");
+    }
+
+    // json_schema without a schema object -> 400 with the text.format.schema path.
+    {
+        Json b = base;
+        b["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
+        bool rejected = false;
+        try {
+            (void)parse_responses_request(b, limits());
+        } catch (const ApiException& error) {
+            rejected = error.error().param == "text.format.schema";
+        }
+        failures += check(rejected, "json_schema missing schema rejected with param path");
+    }
+
+    // Mistyped optional field -> 400.
+    {
+        Json b = base;
+        b["text"] = Json{{"format", Json{{"type", "json_schema"},
+                                         {"schema", Json{{"type", "object"}}},
+                                         {"strict", "yes"}}}};
+        failures += check(
+            throws_api([&] { (void)parse_responses_request(b, limits()); }),
+            "text.format strict must be a boolean");
+    }
+
+    // Unknown field under `text` stays rejected.
+    {
+        Json b = base;
+        b["text"] = Json{{"bias", 1}};
+        failures += check(api_code([&] { (void)parse_responses_request(b, limits()); }) ==
+                              "text_option_not_supported",
+                          "unknown text field rejected");
+    }
+
+    // `text` must be an object.
+    {
+        Json b = base;
+        b["text"] = "json";
+        failures += check(throws_api([&] { (void)parse_responses_request(b, limits()); }),
+                          "non-object text rejected");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -639,6 +739,7 @@ int main() {
     failures += test_reasoning_effort();
     failures += test_typed_items_and_tools();
     failures += test_explicit_rejections();
+    failures += test_text_format();
     failures += test_response_object();
     failures += test_sse_sequence();
     failures += test_sse_function_call();

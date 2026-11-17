@@ -129,6 +129,12 @@ history may include `reasoning_content` and `tool_calls`; a tool result uses rol
 See [`examples/cli/`](../examples/cli/) for committed text, image, video, mixed-media, thinking,
 long-decode, and long-context inputs.
 
+**Output constraints are a serving feature.** The `ninfer` CLI takes no constraint options;
+structured-output constraints (`response_format` `json_object`/`json_schema`, the `guided_*` /
+`grammar` aliases, and `tool_constraints`/`tool_choice`) are set per request on the HTTP server.
+See [serving.md — Structured output constraints](serving.md#structured-output-constraints) for the
+field table, the 400 error contract, and tool-constraint usage.
+
 ## Speculative decoding
 
 Speculative decoding is disabled by default. Select MTP with one to five draft positions.

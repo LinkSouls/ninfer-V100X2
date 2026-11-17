@@ -104,6 +104,19 @@ public:
     [[nodiscard]] PublishedOutput commit_preview() noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
 
+    // Output-constraint (grammar) surface. All calls are no-ops when the session was created
+    // without a constraint. The grammar transaction mirrors the preview/commit boundary:
+    // preview() tentatively accepts its tokens, commit_preview() confirms them.
+    [[nodiscard]] bool constrained() const noexcept;
+    // One position (ordinary decode / prefill bonus token): words must hold at least
+    // (kTokenDomain + 31) / 32 uint32 words.
+    [[nodiscard]] std::uint32_t fill_mask_words(std::span<std::uint32_t> words) const;
+    // (drafts.size() + 1) positions for speculative verification: position p is masked from
+    // the grammar state after the admissible prefix drafts[0..p-1]. Returns dead-position
+    // bits; a dead position keeps only its sentinel word bit.
+    [[nodiscard]] std::uint32_t fill_mask_words(std::span<const TokenId> drafts,
+                                                std::span<std::uint32_t> words) const;
+
 private:
     class Impl;
     explicit OutputSession(std::unique_ptr<Impl> impl) noexcept;

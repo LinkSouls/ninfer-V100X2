@@ -131,6 +131,8 @@ set(BLA_PREFER_PKGCONFIG ON)
 find_package(BLAS REQUIRED)
 
 # --- Subdirectories ----------------------------------------------------------
+add_subdirectory(third_party/xgrammar)
+
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)
   add_subdirectory(apps)

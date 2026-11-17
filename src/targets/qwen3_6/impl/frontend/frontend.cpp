@@ -8,7 +8,10 @@
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
+#include "text/grammar.h"
 #include "text/unicode.h"
+
+#include <xgrammar/tool_grammar.h>
 
 #include <nlohmann/json.hpp>
 
@@ -20,6 +23,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -674,15 +678,70 @@ public:
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
     bool vision_enabled = true;
+
+    // Model-owned constraint compiler, lazily built (the vocabulary copy costs a few tens of
+    // MB, so unconstrained frontends never pay for it).
+    mutable std::mutex grammar_mutex;
+    mutable std::shared_ptr<ninfer::text::GrammarCompiler> grammar_compiler;
+
+    [[nodiscard]] std::shared_ptr<ninfer::text::GrammarCompiler> grammar_compiler_locked() const {
+        if (grammar_compiler == nullptr) {
+            const auto vocab = tokenizer->constraint_vocabulary(kTokenDomain);
+            // Only stop ids inside the vocabulary domain can terminate a match; ids outside it
+            // (or in holes) would name tokens the grammar core cannot address.
+            std::vector<std::int32_t> eos;
+            for (const int token : tokenizer->default_stop_token_ids()) {
+                if (token >= 0 && static_cast<std::size_t>(token) < vocab.size()) { eos.push_back(token); }
+            }
+            grammar_compiler = std::make_shared<ninfer::text::GrammarCompiler>(
+                std::move(vocab), std::move(eos), 64U << 20);
+        }
+        return grammar_compiler;
+    }
 };
+
+// Stable compiler-cache identity for a model-owned tool grammar: the full (name, parameters)
+// set, so distinct tool sets never share a cached grammar.
+std::string qwen_tool_identity(const std::vector<ninfer::ToolSpec>& tools) {
+    std::string key;
+    for (const auto& tool : tools) {
+        key += tool.name;
+        key += '\x1f';
+        key += tool.parameters_json;
+        key += '\x1f';
+    }
+    return key;
+}
 
 class OutputSession::Impl {
 public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
-         bool starts_in_reasoning)
+         bool starts_in_reasoning,
+         std::shared_ptr<ninfer::text::GrammarCompiler> compiler)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
-          preserve_special(output.raw || output.preserve_special_tokens) {
+          preserve_special(output.raw || output.preserve_special_tokens),
+          compiler(std::move(compiler)) {
         state.in_reasoning = starts_in_reasoning && !output.raw;
+        // The initializer moved `compiler` into the member, so the parameter is now null; use the
+        // member. (Checking the moved-from parameter would silently skip grammar setup.)
+        if (output.constraint.has_value() && this->compiler != nullptr) {
+            grammar = this->compiler->compile(*output.constraint, {}, {});
+        } else if (output.tool_constraint != ninfer::ToolConstraintMode::Off &&
+                   !output.tools.empty() && this->compiler != nullptr) {
+            // Model-owned tool grammar (p7 task 3.4): constrain the output to a valid tool call
+            // over the declared tools, in the Qwen XML framing. Built on a cache miss only.
+            std::vector<xgrammar::QwenToolDef> tool_defs;
+            tool_defs.reserve(output.tools.size());
+            for (const auto& tool : output.tools) {
+                tool_defs.push_back(xgrammar::QwenToolDef{tool.name, tool.parameters_json});
+            }
+            grammar = this->compiler->compile_model(
+                qwen_tool_identity(output.tools),
+                [tool_defs = std::move(tool_defs)] {
+                    return xgrammar::BuildQwenToolCallGrammar(tool_defs);
+                },
+                {}, {});
+        }
     }
 
     std::shared_ptr<const fi::Tokenizer> tokenizer;
@@ -692,6 +751,8 @@ public:
     DecoderState preview_state;
     PublishedOutput preview_output;
     bool preview_ready = false;
+    std::shared_ptr<ninfer::text::GrammarCompiler> compiler;
+    std::unique_ptr<ninfer::text::GrammarSession> grammar;
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -795,6 +856,17 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         return runtime::OutputDecision{.accepted_tokens = count, .finish_reason = reason};
     };
 
+    // Reasoning tokens form a prefix of the round and never enter the grammar: the constraint
+    // governs published (content-channel) output only. Every return path must leave the
+    // grammar's tentative state exactly at the committed prefix, so commit_preview() confirms
+    // a consistent matcher.
+    std::size_t reasoning_prefix = 0;
+    const auto accept_grammar_prefix = [&](std::size_t from, std::size_t to) {
+        if (impl_->grammar != nullptr && to > from) {
+            impl_->grammar->accept(std::span<const std::int32_t>(tokens.data() + from, to - from));
+        }
+    };
+
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const std::uint32_t count = static_cast<std::uint32_t>(index + 1);
         const TokenId token       = tokens[index];
@@ -803,7 +875,10 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
                                     std::to_string(token));
         }
 
-        if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
+        if (impl_->preview_state.in_reasoning) {
+            ++impl_->preview_state.reasoning_tokens;
+            reasoning_prefix = index + 1;
+        }
 
         const bool stop_token =
             std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
@@ -822,6 +897,7 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
                          &match);
 
         if (match.found) {
+            accept_grammar_prefix(reasoning_prefix, match.committed_tokens);
             impl_->preview_state  = terminal_state(std::move(impl_->preview_state));
             impl_->preview_output = std::move(match.output);
             return complete(match.committed_tokens, FinishReason::StopString);
@@ -832,11 +908,13 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
                 impl_->preview_state  = std::move(before_state);
                 impl_->preview_output = std::move(before_output);
             }
+            accept_grammar_prefix(reasoning_prefix, count);
             terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
             return complete(count, FinishReason::StopToken);
         }
     }
 
+    accept_grammar_prefix(reasoning_prefix, tokens.size());
     const auto count = static_cast<std::uint32_t>(tokens.size());
     if (tokens.size() == budget_remaining) {
         terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
@@ -867,11 +945,60 @@ PublishedOutput OutputSession::commit_preview() noexcept {
     PublishedOutput output = std::move(impl_->preview_output);
     impl_->preview_output.clear();
     impl_->preview_ready = false;
+    if (impl_->grammar != nullptr) { impl_->grammar->confirm(); }
     return output;
 }
 
 std::uint32_t OutputSession::reasoning_tokens() const noexcept {
     return impl_ != nullptr ? impl_->state.reasoning_tokens : 0;
+}
+
+bool OutputSession::constrained() const noexcept {
+    return impl_ != nullptr && impl_->grammar != nullptr;
+}
+
+// The runtime mask buffer is sized to the model's physical vocabulary width
+// (ceil(output_rows/32) words per position), which can exceed the grammar's
+// token-domain width (mask_words()). The grammar only fills the domain prefix of
+// each lookahead position; the padding tail (out-of-domain rows) is zeroed so
+// those rows are forbidden. Positions beyond the drafted extent are left to the
+// caller, which pre-fills them all-ones for an unmasked no-op.
+std::uint32_t expand_mask_positions(ninfer::text::GrammarSession& grammar,
+                                    std::span<const std::int32_t> drafts,
+                                    std::span<std::uint32_t> words) {
+    const std::size_t positions    = drafts.size() + 1;
+    const std::size_t domain_words = grammar.mask_words();
+    if (words.size() < positions * domain_words) {
+        throw std::logic_error("mask buffer is narrower than the grammar token domain");
+    }
+    const std::size_t physical_words = words.size() / positions;
+    std::vector<std::uint32_t> domain(positions * domain_words);
+    const std::uint32_t dead = grammar.masks(drafts, domain);
+    for (std::size_t position = 0; position < positions; ++position) {
+        std::copy_n(domain.data() + position * domain_words, domain_words,
+                    words.data() + position * physical_words);
+        std::fill_n(words.data() + position * physical_words + domain_words,
+                    physical_words - domain_words, 0u);
+    }
+    return dead;
+}
+
+std::uint32_t OutputSession::fill_mask_words(std::span<std::uint32_t> words) const {
+    if (impl_ == nullptr || impl_->grammar == nullptr) {
+        std::fill(words.begin(), words.end(), 0xFFFFFFFFu); // unconstrained: no-op for the mask op
+        return 0;
+    }
+    return expand_mask_positions(*impl_->grammar, {}, words);
+}
+
+std::uint32_t OutputSession::fill_mask_words(std::span<const TokenId> drafts,
+                                             std::span<std::uint32_t> words) const {
+    if (impl_ == nullptr || impl_->grammar == nullptr) {
+        std::fill(words.begin(), words.end(), 0xFFFFFFFFu);
+        return 0;
+    }
+    return expand_mask_positions(*impl_->grammar,
+                                 std::span<const std::int32_t>(drafts.data(), drafts.size()), words);
 }
 
 Frontend::Frontend(std::shared_ptr<const Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1083,8 +1210,17 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
+    std::shared_ptr<ninfer::text::GrammarCompiler> compiler;
+    const bool need_grammar = output.constraint.has_value() ||
+                              (output.tool_constraint != ninfer::ToolConstraintMode::Off &&
+                               !output.tools.empty());
+    if (need_grammar) {
+        std::lock_guard lock(impl_->grammar_mutex);
+        compiler = impl_->grammar_compiler_locked();
+    }
     return OutputSession(std::make_unique<OutputSession::Impl>(
-        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning));
+        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning,
+        std::move(compiler)));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

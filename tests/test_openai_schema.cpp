@@ -357,11 +357,19 @@ int test_reject_unsupported() {
         throws_api([&] { (void)parse_chat_completion_request(function_call, default_limits()); }),
         "deprecated function_call rejected");
 
-    Json rf               = base;
+    Json rf = base;
     rf["response_format"] = Json{{"type", "json_object"}};
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(rf, default_limits()); }),
-              "json response_format rejected");
+    bool json_object_ok = true;
+    try {
+        (void)parse_chat_completion_request(rf, default_limits());
+    } catch (...) { json_object_ok = false; }
+    failures += check(json_object_ok, "json_object response_format accepted (p7)");
+
+    Json rf_foo              = base;
+    rf_foo["response_format"] = Json{{"type", "foo"}};
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(rf_foo, default_limits()); }),
+        "unsupported response_format type rejected");
 
     Json rf_text               = base;
     rf_text["response_format"] = Json{{"type", "text"}};
@@ -789,6 +797,251 @@ int test_output_token_cap() {
     return failures;
 }
 
+// p7 structured-output constraint matrix: response_format (json_object / json_schema), the
+// guided_* / grammar aliases, and tool_constraints, with the alias/response_format conflict and
+// the tool_constraints + tool_choice combo validation.
+int test_output_constraint() {
+    int failures = 0;
+    const Json base = {{"model", "m"},
+                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    using Kind = ninfer::OutputConstraintKind;
+
+    // json_object -> JsonObject constraint, no source.
+    {
+        Json b = base;
+        b["response_format"] = Json{{"type", "json_object"}};
+        auto req = parse_chat_completion_request(b, default_limits());
+        failures += check(req.constraint.has_value() && req.constraint->kind == Kind::JsonObject,
+                          "json_object -> JsonObject constraint");
+        // translate carries it into OutputOptions.
+        failures += check(to_request_options(req, default_server()).output.constraint.has_value(),
+                          "json_object constraint reaches OutputOptions");
+    }
+
+    // json_schema (valid) -> JsonSchema constraint with the schema serialized into source.
+    {
+        Json b = base;
+        b["response_format"] =
+            Json{{"type", "json_schema"},
+                 {"json_schema", Json{{"name", "person"}, {"schema", Json{{"type", "object"}}}}}};
+        auto req = parse_chat_completion_request(b, default_limits());
+        failures += check(req.constraint.has_value() && req.constraint->kind == Kind::JsonSchema,
+                          "json_schema -> JsonSchema constraint");
+        failures += check(!req.constraint->source.empty() &&
+                              req.constraint->source.find("\"type\"") != std::string::npos,
+                          "json_schema source carries the schema");
+    }
+
+    // json_schema without a schema object -> 400 with the param path.
+    {
+        Json b = base;
+        b["response_format"] =
+            Json{{"type", "json_schema"}, {"json_schema", Json{{"name", "x"}}}};
+        bool rejected = false;
+        try {
+            (void)parse_chat_completion_request(b, default_limits());
+        } catch (const ApiException& e) {
+            rejected = e.error().param == "response_format.json_schema.schema";
+        }
+        failures += check(rejected, "json_schema missing schema rejected with param path");
+    }
+
+    // json_schema with an unsupported field -> 400.
+    {
+        Json b = base;
+        b["response_format"] =
+            Json{{"type", "json_schema"},
+                 {"json_schema",
+                  Json{{"schema", Json{{"type", "object"}}}, {"bogus", 1}}}};
+        failures += check(
+            throws_api([&] { (void)parse_chat_completion_request(b, default_limits()); }),
+            "json_schema unsupported field rejected");
+    }
+
+    // guided_regex -> Regex.
+    {
+        Json b = base;
+        b["guided_regex"] = "^[0-9]+$";
+        auto req = parse_chat_completion_request(b, default_limits());
+        failures +=
+            check(req.constraint.has_value() && req.constraint->kind == Kind::Regex,
+                  "guided_regex -> Regex constraint");
+        failures += check(req.constraint->source == "^[0-9]+$", "guided_regex source kept");
+    }
+
+    // guided_choice -> Choice with the member list.
+    {
+        Json b = base;
+        b["guided_choice"] = Json::array({"red", "green", "blue"});
+        auto req = parse_chat_completion_request(b, default_limits());
+        failures += check(req.constraint.has_value() && req.constraint->kind == Kind::Choice,
+                          "guided_choice -> Choice constraint");
+        failures += check(req.constraint->choices.size() == 3, "choice members parsed");
+    }
+
+    // grammar -> Grammar.
+    {
+        Json b = base;
+        b["grammar"] = R"(root ::= "ab" | "cd")";
+        auto req = parse_chat_completion_request(b, default_limits());
+        failures += check(req.constraint.has_value() && req.constraint->kind == Kind::Grammar,
+                          "grammar -> Grammar constraint");
+    }
+
+    // alias + response_format conflict -> 400.
+    {
+        Json b = base;
+        b["response_format"] = Json{{"type", "json_object"}};
+        b["guided_regex"]    = "^[0-9]+$";
+        failures +=
+            check(throws_api([&] { (void)parse_chat_completion_request(b, default_limits()); }),
+                  "alias + response_format conflict rejected");
+    }
+
+    // tool_constraints "basic" with tools + required tool_choice -> accepted.
+    {
+        Json parameters = Json::object();
+        parameters["type"] = "object";
+        Json city        = Json::object();
+        city["type"]     = "string";
+        parameters["properties"] = Json{{"city", city}};
+        parameters["required"]   = Json::array({"city"});
+        Json function           = Json::object();
+        function["name"]        = "get_weather";
+        function["parameters"]  = parameters;
+        Json tool              = Json::object();
+        tool["type"]           = "function";
+        tool["function"]       = function;
+
+        Json b = base;
+        b["tools"] = Json::array({tool});
+        b["tool_choice"]      = "required";
+        b["tool_constraints"] = "basic";
+        auto req = parse_chat_completion_request(b, default_limits());
+        failures += check(req.tool_constraints == "basic", "tool_constraints basic accepted");
+        failures += check(req.tool_choice.mode == ToolChoiceMode::Required,
+                          "tool_choice required carried");
+    }
+
+    // tool_constraints "required" with no tools -> 400 (parse_tool_choice combo).
+    {
+        Json b = base;
+        b["tool_choice"]      = "required";
+        b["tool_constraints"] = "basic";
+        failures +=
+            check(throws_api([&] { (void)parse_chat_completion_request(b, default_limits()); }),
+                  "tool_choice required with no tools rejected");
+    }
+
+    // tool_constraints invalid value -> 400.
+    {
+        Json b = base;
+        b["tool_constraints"] = "strict";
+        bool rejected = false;
+        try {
+            (void)parse_chat_completion_request(b, default_limits());
+        } catch (const ApiException& e) {
+            rejected = e.error().param == "tool_constraints";
+        }
+        failures += check(rejected, "invalid tool_constraints rejected with param path");
+    }
+
+    // guided_json: empty string -> generic JsonObject; schema string -> JsonSchema.
+    {
+        Json b = base;
+        b["guided_json"] = "";
+        auto req = parse_chat_completion_request(b, default_limits());
+        failures += check(req.constraint.has_value() && req.constraint->kind == Kind::JsonObject,
+                          "guided_json empty -> JsonObject constraint");
+        b["guided_json"] = R"({"type":"object","required":["a"]})";
+        req = parse_chat_completion_request(b, default_limits());
+        failures += check(req.constraint.has_value() && req.constraint->kind == Kind::JsonSchema &&
+                              req.constraint->source.find("required") != std::string::npos,
+                          "guided_json schema string -> JsonSchema constraint");
+        b["guided_json"] = "not json";
+        failures += check(throws_api([&] { (void)parse_chat_completion_request(b, default_limits()); }),
+                          "guided_json non-JSON string rejected");
+        b["guided_json"] = R"(["a"])";
+        failures +=
+            check(throws_api([&] { (void)parse_chat_completion_request(b, default_limits()); }),
+                  "guided_json non-object schema rejected");
+    }
+
+    // Multiple aliases in one request -> 400 naming the second alias.
+    {
+        Json b = base;
+        b["guided_regex"]  = "^[0-9]+$";
+        b["guided_choice"] = Json::array({"x"});
+        bool rejected = false;
+        try {
+            (void)parse_chat_completion_request(b, default_limits());
+        } catch (const ApiException& e) {
+            rejected = e.error().param == "guided_choice";
+        }
+        failures += check(rejected, "two aliases rejected naming the second");
+    }
+
+    // Alias + response_format {type:"text"} is not a conflict: the alias wins.
+    {
+        Json b = base;
+        b["response_format"] = Json{{"type", "text"}};
+        b["guided_regex"]    = "^[0-9]+$";
+        auto req = parse_chat_completion_request(b, default_limits());
+        failures += check(req.constraint.has_value() && req.constraint->kind == Kind::Regex,
+                          "alias with text response_format accepted, alias wins");
+    }
+
+    // json_schema optional fields are type-checked.
+    {
+        Json b = base;
+        b["response_format"] =
+            Json{{"type", "json_schema"},
+                 {"json_schema",
+                  Json{{"schema", Json{{"type", "object"}}}, {"name", 7}}}};
+        bool rejected = false;
+        try {
+            (void)parse_chat_completion_request(b, default_limits());
+        } catch (const ApiException& e) {
+            rejected = e.error().param == "response_format.json_schema.name";
+        }
+        failures += check(rejected, "json_schema name must be a string");
+
+        b["response_format"] =
+            Json{{"type", "json_schema"},
+                 {"json_schema",
+                  Json{{"schema", Json{{"type", "object"}}}, {"strict", "yes"}}}};
+        rejected = false;
+        try {
+            (void)parse_chat_completion_request(b, default_limits());
+        } catch (const ApiException& e) {
+            rejected = e.error().param == "response_format.json_schema.strict";
+        }
+        failures += check(rejected, "json_schema strict must be a boolean");
+    }
+
+    // tool_choice naming an undeclared tool -> 400 with the tool_choice param path.
+    {
+        Json function = Json::object();
+        function["name"] = "get_weather";
+        Json tool       = Json::object();
+        tool["type"]    = "function";
+        tool["function"] = function;
+        Json b = base;
+        b["tools"] = Json::array({tool});
+        b["tool_choice"] =
+            Json{{"type", "function"}, {"function", Json{{"name", "other_tool"}}}};
+        bool rejected = false;
+        try {
+            (void)parse_chat_completion_request(b, default_limits());
+        } catch (const ApiException& e) {
+            rejected = e.error().param == "tool_choice";
+        }
+        failures += check(rejected, "tool_choice referencing unknown tool rejected");
+    }
+
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -812,6 +1065,7 @@ int main() {
     failures += test_cache_usage_serialization();
     failures += test_models_and_error();
     failures += test_finish_reason_wire();
+    failures += test_output_constraint();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

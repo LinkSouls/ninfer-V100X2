@@ -241,6 +241,20 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
+    // Structured-output constraint (p7): carried from the wire layer; empty stays unconstrained.
+    options.output.constraint          = request.constraint;
+    // Constrained tool-calling (p7 task 3.4): "basic" enables the model-owned tool grammar over
+    // the declared tools; "auto" and "" leave the tool decision unconstrained. Tools are carried
+    // only in a constrained mode, so the frontend builds the grammar on demand.
+    if (request.tool_constraints == "basic" && request.uses_tools()) {
+        options.output.tool_constraint = ninfer::ToolConstraintMode::Basic;
+        options.output.tools.reserve(request.tools.size());
+        for (const ToolDefinition& tool : request.tools) {
+            options.output.tools.push_back(
+                ninfer::ToolSpec{.name            = tool.name,
+                                 .parameters_json = tool.parameters_json});
+        }
+    }
     options.stop.strings.reserve(request.stop_strings.size());
     for (const std::string& stop : request.stop_strings) {
         if (!stop.empty()) {

@@ -183,6 +183,11 @@ public:
             .active_lanes = max_concurrency_, .main_kv_pages = max_concurrency_, .backend_kv_pages = 0};
     }
 
+    ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::None;
+    [[nodiscard]] ninfer::SpeculativeBackend speculative_backend() const noexcept {
+        return backend;
+    }
+
     std::function<double(const ninfer::PreparationControl&)> media_preparation;
     double prepare_media(q36::PreparedPrompt&, const ninfer::PreparationControl& control) const {
         return media_preparation ? media_preparation(control) : 0.0;
@@ -222,7 +227,8 @@ public:
     }
 
     rt::PrefillStepResult start_prefill_lane(std::uint32_t lane, q36::PreparedPrompt&& prompt,
-                                             ScriptedPlan&& plan, rt::TransientRegion) {
+                                             ScriptedPlan&& plan, rt::TransientRegion,
+                                             const q36::OutputSession* = nullptr) {
         if (queued_.empty()) { throw std::logic_error("scripted program has no remaining script"); }
         Lane& state     = lanes_[lane];
         state.script    = std::move(queued_.front());
@@ -778,6 +784,60 @@ void test_host_preparation_failure_releases_capacity(const q36::Frontend& fronte
     }
 }
 
+// Backend capability guard (design D7): a constrained request is rejected at submission on a
+// DFlash instance (its verify-step masks cannot be host-computed) and NOT rejected on an MTP
+// instance. The guard is a submission-boundary property, so the MTP case asserts the guard does
+// not fire, independent of whether the scripted tokens happen to satisfy the grammar.
+void test_constraint_backend_guard(const q36::Frontend& frontend,
+                                   const ninfer::DeviceContext& device) {
+    // DFlash: the guard fires before the request is queued.
+    {
+        ScriptedInstance instance{.loaded = std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                                  .program = std::make_unique<ScriptedProgram>(1),
+                                  .request_memory = {}, .kv_capacity_resolution = {}};
+        instance.program->backend = ninfer::SpeculativeBackend::DFlash;
+        Executor executor(instance, executor_options(), device);
+        auto prompt              = frontend.prepare_tokens({0});
+        const auto summary       = prompt.summary();
+        auto options             = request_options(1);
+        options.output.constraint = ninfer::OutputConstraint::json_object();
+        bool rejected            = false;
+        try {
+            (void)executor.submit(std::move(prompt), summary, 0.0, options);
+        } catch (const ninfer::RequestError& error) {
+            rejected = error.kind() == ninfer::RequestErrorKind::ConstraintUnsupportedByBackend;
+        }
+        expect(rejected, "DFlash instance accepted a constrained request");
+    }
+
+    // MTP: the guard does NOT fire; the constrained request is accepted for execution.
+    {
+        ScriptedInstance instance{.loaded = std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                                  .program = std::make_unique<ScriptedProgram>(1),
+                                  .request_memory = {}, .kv_capacity_resolution = {}};
+        instance.program->backend = ninfer::SpeculativeBackend::Mtp;
+        instance.program->push_script(GenerationScript{.tokens = {0}});
+        Executor executor(instance, executor_options(), device);
+        auto prompt              = frontend.prepare_tokens({0});
+        const auto summary       = prompt.summary();
+        auto options             = request_options(1);
+        options.output.constraint = ninfer::OutputConstraint::json_object();
+        bool guard_fired         = false;
+        bool submitted           = false;
+        try {
+            auto submission = executor.submit(std::move(prompt), summary, 0.0, options);
+            submitted       = true;
+            (void)await(std::move(submission));
+        } catch (const ninfer::RequestError& error) {
+            guard_fired = error.kind() == ninfer::RequestErrorKind::ConstraintUnsupportedByBackend;
+        } catch (const std::exception&) {
+            // A non-guard failure (e.g. the scripted token violating the grammar) is fine for this
+            // test; only the backend guard is under assertion.
+        }
+        expect(submitted && !guard_fired, "MTP instance fired the DFlash backend guard");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -799,5 +859,6 @@ int main() {
     test_prefill_decode_rounds(frontend, device, 4, 64);
     test_prefill_decode_rounds(frontend, device, 4, 3);
     test_host_preparation_failure_releases_capacity(frontend, device);
+    test_constraint_backend_guard(frontend, device);
     return failures == 0 ? 0 : 1;
 }

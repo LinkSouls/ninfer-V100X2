@@ -223,6 +223,56 @@ struct StopString {
     bool include_in_output = false;
 };
 
+// Output constraint kinds. Source owns the GBNF, JSON Schema or regex text; Choice owns its
+// literal alternatives; JsonObject carries no payload.
+enum class OutputConstraintKind : std::uint8_t { Grammar, JsonObject, JsonSchema, Choice, Regex };
+
+struct OutputConstraint {
+    OutputConstraintKind kind = OutputConstraintKind::Grammar;
+    std::string source;
+    std::vector<std::string> choices;
+
+    [[nodiscard]] static OutputConstraint grammar(std::string source) {
+        return {OutputConstraintKind::Grammar, std::move(source), {}};
+    }
+
+    [[nodiscard]] static OutputConstraint json_object() {
+        return {OutputConstraintKind::JsonObject, {}, {}};
+    }
+
+    [[nodiscard]] static OutputConstraint json_schema(std::string source) {
+        return {OutputConstraintKind::JsonSchema, std::move(source), {}};
+    }
+
+    [[nodiscard]] static OutputConstraint choice(std::vector<std::string> values) {
+        return {OutputConstraintKind::Choice, {}, std::move(values)};
+    }
+
+    [[nodiscard]] static OutputConstraint regex(std::string pattern) {
+        return {OutputConstraintKind::Regex, std::move(pattern), {}};
+    }
+
+    bool operator==(const OutputConstraint&) const = default;
+};
+
+// Observation of one request's constraint work. Times are subintervals of existing request
+// timings, not extra latency to add to them.
+enum class ConstraintCacheAccess : std::uint8_t { Hit, Built, Waited };
+enum class ConstraintOutputBranch : std::uint8_t { Undecided, Content, Tools };
+
+struct ConstraintObservation {
+    ConstraintOutputBranch branch   = ConstraintOutputBranch::Undecided;
+    bool complete                   = false;
+    bool terminated                 = false;
+    ConstraintCacheAccess cache     = ConstraintCacheAccess::Hit;
+    bool timings_collected          = false;
+    double prepare_seconds          = 0.0;
+    double mask_seconds             = 0.0;
+    double matcher_seconds          = 0.0;
+    std::uint64_t mask_positions    = 0;
+    std::uint64_t mask_upload_bytes = 0;
+};
+
 struct StopPolicy {
     std::vector<TokenId> token_ids;
     std::vector<StopString> strings;
@@ -236,9 +286,28 @@ struct ExecutionOptions {
     bool allow_prefix_reuse               = true;
 };
 
+struct ToolSpec {
+    std::string name;
+    std::string parameters_json; // JSON schema of the tool's arguments
+};
+
+// Constrained tool-calling mode. Off leaves sampling unconstrained; when enabled and tools
+// are present, the model-owned tool grammar constrains the output to a valid tool call.
+enum class ToolConstraintMode : std::uint8_t {
+    Off = 0,
+    Basic = 1,
+};
+
 struct OutputOptions {
     bool raw                     = false;
     bool preserve_special_tokens = false;
+    // Optional output-constraint language for this generation. Empty leaves sampling
+    // unconstrained and bit-identical to the pre-constraint behavior.
+    std::optional<OutputConstraint> constraint;
+    // Constrained tool-calling. When `tool_constraint` is not Off and `tools` is non-empty,
+    // the model-owned tool grammar constrains the output to a valid tool call over `tools`.
+    ToolConstraintMode tool_constraint = ToolConstraintMode::Off;
+    std::vector<ToolSpec> tools;
 };
 
 struct RequestOptions {
@@ -338,6 +407,8 @@ struct PromptInput {
     PromptOptions options;
 };
 
+// Request-level error taxonomy. Kinds carry stable identity for protocol adapters; the
+// message plus JSON pointer describe the offending location.
 enum class RequestErrorKind : std::uint8_t {
     ContextLengthExceeded,
     MediaBudgetExceeded,
@@ -345,17 +416,34 @@ enum class RequestErrorKind : std::uint8_t {
     QueueTimeout,
     Cancelled,
     Unavailable,
+    InvalidGrammar,
+    InvalidChoice,
+    InvalidRegex,
+    InvalidJsonSchema,
+    UnsupportedJsonSchema,
+    UnsatisfiableJsonSchema,
+    InvalidToolConstraint,
+    ConstraintDeadEnd,
+    ConstraintUnsupportedByBackend,
 };
+
+enum class RequestErrorSource : std::uint8_t { OutputConstraint, Tools };
 
 class RequestError final : public std::invalid_argument {
 public:
-    RequestError(RequestErrorKind kind, std::string message)
-        : std::invalid_argument(std::move(message)), kind_(kind) {}
+    RequestError(RequestErrorKind kind, std::string message, std::string pointer = {},
+                 RequestErrorSource source = RequestErrorSource::OutputConstraint)
+        : std::invalid_argument(std::move(message)), kind_(kind), pointer_(std::move(pointer)),
+          source_(source) {}
 
     [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
+    [[nodiscard]] RequestErrorSource source() const noexcept { return source_; }
+    [[nodiscard]] const std::string& pointer() const noexcept { return pointer_; }
 
 private:
     RequestErrorKind kind_;
+    std::string pointer_;
+    RequestErrorSource source_;
 };
 
 struct PromptSummary {

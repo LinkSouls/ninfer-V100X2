@@ -774,6 +774,19 @@ std::string Tokenizer::decode_token_bytes(int id, bool skip_special_tokens) cons
     }
     return bytes;
 }
+std::vector<std::string> Tokenizer::constraint_vocabulary(std::size_t domain) const {
+    domain = std::min(domain, id_to_token_.size());
+    std::vector<std::string> pieces(domain);
+    for (std::size_t id = 0; id < domain; ++id) {
+        // Invalid ids (holes in the loaded vocabulary) stay empty: the grammar core treats an
+        // empty entry as a forbidden/special token, which is exactly what an unusable id is.
+        if (is_valid_token(static_cast<int>(id))) {
+            pieces[id] = decode_token_bytes(static_cast<int>(id), false);
+        }
+    }
+    return pieces;
+}
+
 
 bool Tokenizer::is_special_token(int id) const noexcept {
     return std::any_of(added_tokens_.begin(), added_tokens_.end(),

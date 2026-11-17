@@ -15,6 +15,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "ninfer/ops/gdn_gating.h"
+#include "ninfer/ops/token_mask.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/gqa_attention.h"
@@ -775,7 +776,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
                                            const Tensor& linear_state_slots,
                                            ops::GqaExecutionEnvelope envelope, Tensor& hidden,
-                                           Tensor& logits, Tensor& target_tokens, Tap& tap) {
+                                           Tensor& logits, Tensor& target_tokens,
+                                           const Tensor& target_masks, Tap& tap) {
     if (tp2()) {
         throw std::logic_error("use tensor-parallel target_verify_batch overload");
     }
@@ -826,6 +828,9 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
         ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+        if (target_masks.data != nullptr) {
+            ops::apply_token_mask_columns(flat_logits, target_masks, stream);
+        }
         ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
     }
     work_.reset();
@@ -835,11 +840,13 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& rope_positions, const Tensor& valid_columns,
                                       const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                       ops::GqaExecutionEnvelope envelope, Tensor& hidden,
-                                      Tensor& logits, Tensor& target_tokens, bool greedy_target) {
+                                      Tensor& logits, Tensor& target_tokens,
+                                      const Tensor& target_masks, bool greedy_target) {
     (void)greedy_target;
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_slots, envelope, hidden, logits, target_tokens, tap);
+                             linear_state_slots, envelope, hidden, logits, target_tokens,
+                             target_masks, tap);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -847,10 +854,12 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                       ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                       Tensor& logits, Tensor& target_tokens,
-                                      DFlashFeatureSink& sink, bool greedy_target) {
+                                      DFlashFeatureSink& sink, const Tensor& target_masks,
+                                      bool greedy_target) {
     (void)greedy_target;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_slots, envelope, hidden, logits, target_tokens, sink);
+                             linear_state_slots, envelope, hidden, logits, target_tokens,
+                             target_masks, sink);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
@@ -1382,6 +1391,17 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
                 ops::linear(last_xf, *lm_head_, logits, s);
+                // Output-constraint step for the prefill bonus token: forbid the disallowed
+                // candidates before sampling. Unconstrained lanes leave prefill_token_mask_ null,
+                // so this is a no-op and the bit-identical path is untouched.
+                if (prefill_token_mask_ != nullptr) {
+                    const std::size_t mask_words = (kCfg.vocab + 31) / 32;
+                    Tensor mask_tensor = work_.alloc(DType::I32, {1, mask_words, 1, 1});
+                    CUDA_CHECK(cudaMemcpyAsync(mask_tensor.data, prefill_token_mask_,
+                                               mask_words * sizeof(std::uint32_t),
+                                               cudaMemcpyHostToDevice, s));
+                    ops::apply_token_mask_columns(logits, mask_tensor, s);
+                }
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).
@@ -2018,7 +2038,7 @@ void TextContext::mlp_tail_tp2(
 
 void TextContext::run_layers_tp2(std::array<Tensor, kMaximumExecutionDevices>& x, Phase phase,
                                 const std::array<Tensor, kMaximumExecutionDevices>& staging,
-                                DFlashFeatureSink* sink) {
+                                DFlashFeatureSink* sink, const bridge_dump::DumpSink* dump) {
     if (sink != nullptr) { sink->begin(x[0]); }
     const bool prefill = phase == Phase::Prefill;
     auto input_norm_scopes = workspace_scopes();
@@ -2106,6 +2126,7 @@ void TextContext::run_layers_tp2(std::array<Tensor, kMaximumExecutionDevices>& x
             }
         }
         if (sink != nullptr) { sink->capture_layer(layer, x[0], stream_for(0)); }
+        if (dump != nullptr) { dump->capture_layer(layer, x[0], stream_for(0)); }
     }
     if (sink != nullptr) { sink->capture_positions(rank_cache_positions(0), stream_for(0)); }
 }
@@ -2224,6 +2245,11 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         throw std::overflow_error("TextContext::prefill absolute position exceeds int32");
     }
     const int base_i = static_cast<int>(text_kv_base_);
+    // p9-vision-prefix-bridge-nvfp4: opt-in dump. "cold" (base == 0) vs "reused" (prefix restored)
+    // labels the two paths the investigation compares. Compiles away without the dump macro.
+    auto bridge_dump_sink =
+        bridge_dump::make_sink(text_kv_base_ == 0 ? "cold" : "reused");
+    if (bridge_dump_sink != nullptr) { bridge_dump_sink->chunk_begin = base_i; }
     if (multimodal != nullptr) {
         if (multimodal->positions.size() != 3 * multimodal->token_ids.size() ||
             multimodal->vision == nullptr || multimodal->begin != text_kv_base_) {
@@ -2345,7 +2371,7 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         const ops::GqaExecutionEnvelope chunk_envelope{visible, visible};
         ScopedEnvelope scoped_envelope(active_gqa_envelope_, chunk_envelope);
 
-        run_layers_tp2(x, Phase::Prefill, staging, dflash_sink);
+        run_layers_tp2(x, Phase::Prefill, staging, dflash_sink, bridge_dump_sink.get());
 
         std::array<Tensor, kMaximumExecutionDevices> xf;
         xf[0] = prefill_hidden_.data != nullptr ? matrix_window(prefill_hidden_, len)
@@ -2361,16 +2387,28 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
             ops::rmsnorm(x[r], final_norm_for(rank), kCfg.rms_eps, true,
                          xf[r], stream_for(rank));
         });
+        if (bridge_dump_sink != nullptr) { bridge_dump_sink->end(xf[0], ctx_.stream); }
 
         if (is_last) {
             const auto last = rank_map([&](int rank) { return xf[rank].slice(1, len - 1, 1); });
             const auto rank_logits = rank_map([&](int rank) { return matrix_window(io_for(rank).logits, 1); });
             Tensor logits = rank_logits[0];
             logits_tp2(last, rank_logits);
+            if (bridge_dump_sink != nullptr) { bridge_dump_sink->dump_logits(logits, ctx_.stream); }
             // Sampling belongs to rank 0 alone: it consumes the reconstructed FULL logits and
             // writes the single committed token.
             const CurrentDevice restore;
             CUDA_CHECK(cudaSetDevice(ctx_.device));
+            // Output-constraint step for the prefill bonus token: rank 0 applies the mask to the
+            // reconstructed FULL logits before sampling. Unconstrained lanes leave it null (no-op).
+            if (prefill_token_mask_ != nullptr) {
+                const std::size_t mask_words = (kCfg.vocab + 31) / 32;
+                Tensor mask_tensor = work_.alloc(DType::I32, {1, mask_words, 1, 1});
+                CUDA_CHECK(cudaMemcpyAsync(mask_tensor.data, prefill_token_mask_,
+                                           mask_words * sizeof(std::uint32_t),
+                                           cudaMemcpyHostToDevice, ctx_.stream));
+                ops::apply_token_mask_columns(logits, mask_tensor, ctx_.stream);
+            }
             ops::set_i32_scalar(io_.pos, base_i + T, ctx_.stream);
             ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, ctx_.stream);
             if (sampling_config_ != nullptr) {
@@ -2436,6 +2474,9 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                     }
                 }
                 mtp_embeddings_ptr = &mtp_embeddings;
+                if (bridge_dump_sink != nullptr) {
+                    bridge_dump_sink->dump_mtp_align_embeddings(mtp_embeddings, ctx_.stream);
+                }
             }
             const auto ar_hidden = rank_map([&](int rank) { return io_for(rank).mtp->ar_hidden; });
             const auto mtp_logits = rank_map([&](int rank) { return matrix_window(io_for(rank).logits, 1); });
@@ -2844,6 +2885,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
                                       const std::array<Tensor, kMaximumExecutionDevices>& hidden,
                                       const std::array<Tensor, kMaximumExecutionDevices>& logits,
                                       const std::array<Tensor, kMaximumExecutionDevices>& target_tokens,
+                                      const std::array<Tensor, kMaximumExecutionDevices>& target_masks,
                                       bool greedy_target) {
     if (!tp2()) { throw std::logic_error("tensor-parallel target verify requires a peer"); }
     const ExecutionContext& execution       = ec();
@@ -2923,15 +2965,22 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
             ops::rmsnorm(x[r], final_norm_for(rank), kCfg.rms_eps, true,
                          flat_hidden[r], stream_for(rank));
         });
-        if (greedy_target) {
+        if (greedy_target && target_masks[0].data == nullptr) {
+            // Unconstrained greedy verify keeps the fused hidden-reduction argmax: no logit
+            // materialization, bit-identical to the pre-constraint path.
             target_argmax_tp2(flat_hidden,
                               rank_map([&](int rank) { return target_tokens[rank].view({columns}); }));
         } else {
             logits_tp2(flat_hidden, flat_logits);
             // The argmax is replicated, not rank 0's alone: both ranks hold the identical gathered
-            // logits and rank 1 needs its own target tokens for acceptance without a control transfer.
+            // logits and rank 1 needs its own target tokens for acceptance without a control
+            // transfer. A per-rank mask (output-constraint verify) forbids the disallowed tokens
+            // before the argmax; all-ones rows are a bit-identical no-op.
             for_each_rank(execution, [&](int rank) {
                 const auto r       = static_cast<std::size_t>(rank);
+                if (target_masks[r].data != nullptr) {
+                    ops::apply_token_mask_columns(flat_logits[r], target_masks[r], stream_for(rank));
+                }
                 Tensor flat_tokens = target_tokens[r].view({columns});
                 ops::argmax(flat_logits[r], flat_tokens, kCfg.token_domain, stream_for(rank));
             });
@@ -2951,7 +3000,9 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
                                       const std::array<Tensor, kMaximumExecutionDevices>& hidden,
                                       const std::array<Tensor, kMaximumExecutionDevices>& logits,
                                       const std::array<Tensor, kMaximumExecutionDevices>& target_tokens,
-                                      DFlashFeatureSink& sink, bool greedy_target) {
+                                      DFlashFeatureSink& sink,
+                                      const std::array<Tensor, kMaximumExecutionDevices>& target_masks,
+                                      bool greedy_target) {
     if (!tp2()) { throw std::logic_error("tensor-parallel target verify requires a peer"); }
     const ExecutionContext& execution = ec();
     const std::array<WorkspaceArena*, kMaximumExecutionDevices> ws = workspaces();
@@ -3021,13 +3072,16 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
                 }
             });
         }
-        if (greedy_target) {
+        if (greedy_target && target_masks[0].data == nullptr) {
             target_argmax_tp2(flat_hidden,
                               rank_map([&](int rank) { return target_tokens[rank].view({width * batch}); }));
         } else {
             logits_tp2(flat_hidden, flat_logits);
             for_each_rank(execution, [&](int rank) {
                 const auto r = static_cast<std::size_t>(rank);
+                if (target_masks[r].data != nullptr) {
+                    ops::apply_token_mask_columns(flat_logits[r], target_masks[r], stream_for(rank));
+                }
                 Tensor flat_tokens = target_tokens[r].view({width * batch});
                 ops::argmax(flat_logits[r], flat_tokens, kCfg.token_domain, stream_for(rank));
             });

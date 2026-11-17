@@ -4,6 +4,7 @@
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/types.h"
+#include "ninfer/targets/qwen3_6/frontend.h"
 
 #include <array>
 #include <cstddef>
@@ -17,9 +18,17 @@ inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDra
 inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
 
+// The per-position output-constraint mask width is the PHYSICAL vocabulary width in 32-token
+// words: ceil(output_rows / 32), carried by RoundStateSpec::mask_words. The grammar session
+// itself only covers the token domain (kTokenDomain in this package's frontend.h); the extra
+// words (padding rows beyond the domain) are zero-filled by OutputSession::fill_mask_words, so
+// constrained lanes also forbid the out-of-domain rows.
+
 struct RoundStateSpec {
     std::int32_t hidden          = 0;
     std::int32_t output_rows     = 0;
+    // ceil(output_rows / 32): per-position output-constraint mask words (see the note above).
+    std::int32_t mask_words      = 0;
     std::uint32_t batch_capacity = 1;
     std::uint32_t draft_window   = 0;
     std::int32_t gdn_record_norm_heads = 0;
@@ -36,6 +45,10 @@ struct OrdinaryDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> lanes{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    // 1 when the lane carries an output constraint this round; the mask words ride a separate
+    // program-owned pinned staging buffer (kept out of this struct to keep the per-round copy
+    // small) and are all-ones for unconstrained lanes.
+    std::array<std::uint8_t, kMaximumConcurrency> token_mask_flags{};
 };
 
 struct OrdinaryDecodeEgress {
@@ -57,6 +70,9 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> lanes{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    // Per-lane output-constraint flag; the (k+1)-position mask words ride the program's
+    // pinned staging buffer, one word block per (lane, draft position).
+    std::array<std::uint8_t, kMaximumConcurrency> token_mask_flags{};
 };
 
 struct MtpDecodeEgress {
@@ -80,6 +96,9 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> lanes{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    // Per-lane output-constraint flag; the (draft+1)-position mask words ride the program's
+    // pinned staging buffer, one word block per (lane, draft position).
+    std::array<std::uint8_t, kMaximumConcurrency> token_mask_flags{};
 };
 
 struct DFlashDecodeEgress {
@@ -93,6 +112,10 @@ struct OrdinaryDecodeStateLayout {
     LayoutRegion egress;
     TensorRegion logits;
     TensorRegion hidden;
+    // Per-lane output-constraint mask words, [spec.mask_words, batch] (words fastest). Staged
+    // from the program's pinned buffer by the decode body before sampling; all-ones rows are a
+    // bit-identical no-op, so the mask op can stay unconditional inside captured graphs.
+    TensorRegion mask_words;
 };
 
 struct MtpPrefillStateLayout {
@@ -123,6 +146,14 @@ struct MtpDecodeStateLayout {
     TensorRegion ar_positions;
     TensorRegion ar_rope_positions;
     TensorRegion ar_valid_columns;
+    // Per-(lane, verify position) output-constraint mask words: [columns * spec.mask_words,
+    // batch] (word index fastest within a lane block). Staged from the program's pinned buffer
+    // by the MTP decode body before target verification; all-ones rows are a bit-identical
+    // no-op, so the mask op can stay unconditional inside captured graphs.
+    TensorRegion mask_words;
+    // Per-position mask words (the spec's physical-vocabulary width); mirrors
+    // RoundStateSpec::mask_words for the state-constructor dimension check.
+    std::int32_t mask_words_per_position = 0;
 };
 
 struct DFlashDecodeStateLayout {
@@ -170,6 +201,7 @@ struct OrdinaryDecodeState {
     Tensor sampled_tokens;
     Tensor logits;
     Tensor hidden;
+    Tensor mask_words;
 
     OrdinaryDecodeState() = default;
     OrdinaryDecodeState(DeviceSpan backing, const OrdinaryDecodeStateLayout& layout,
@@ -234,6 +266,7 @@ struct MtpDecodeState {
     Tensor ar_positions;
     Tensor ar_rope_positions;
     Tensor ar_valid_columns;
+    Tensor mask_words;
 
     MtpDecodeState() = default;
     MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,

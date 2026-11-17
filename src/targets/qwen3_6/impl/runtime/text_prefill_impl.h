@@ -4,6 +4,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
+#include "ninfer/ops/token_mask.h"
 
 #include <cuda_runtime.h>
 
@@ -81,6 +82,10 @@ PrefillChunkResult prefill_text_chunk(
             : -1);
     const std::span<const int> prompt(ids.data(), ids.size());
     card.set_rope_delta(state.rope_delta);
+    // The prefill's bonus (first generated) token must honor the output constraint. The mask words
+    // are staged on the host by the program (PrefillContext.token_mask_words); prefill_chunk
+    // applies them to the bonus logits before sampling. Null for unconstrained lanes (a no-op).
+    card.set_prefill_token_mask(state.token_mask_words);
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
@@ -196,6 +201,21 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
+    if (state.token_mask_words != nullptr) {
+        // Output-constraint step for the first generated token: stage this lane's initial-position
+        // mask words and forbid the disallowed tokens before sampling. Null for unconstrained
+        // lanes, which stay on the untouched bit-identical path. Prefill is not graph-captured,
+        // so the conditional staging is safe here (unlike the decode body). The staging row is
+        // the physical-vocabulary width in words; derive it from the logits so the op contract
+        // (ceil(V/32)) holds even when output_rows exceeds the grammar token domain.
+        const std::int32_t mask_words = (logits.ne[0] + 31) / 32;
+        Tensor mask_tensor =
+            state.execution.work.alloc(DType::I32, {1, mask_words, 1, 1});
+        CUDA_CHECK(cudaMemcpyAsync(mask_tensor.data, state.token_mask_words,
+                                   static_cast<std::size_t>(mask_words) * sizeof(std::uint32_t),
+                                   cudaMemcpyHostToDevice, state.execution.device.stream));
+        ops::apply_token_mask_columns(logits, mask_tensor, state.execution.device.stream);
+    }
     ops::sample(logits, state.execution.io.token, TextConfig::token_domain, state.sampling,
                 state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);

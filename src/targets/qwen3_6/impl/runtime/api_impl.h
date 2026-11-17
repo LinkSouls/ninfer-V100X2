@@ -166,9 +166,10 @@ template <>
 runtime::PrefillStepResult
 Program<Variant>::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
                                      RequestPlan<Variant>&& plan,
-                                     runtime::TransientRegion transient) {
+                                     runtime::TransientRegion transient,
+                                     const OutputSession* output_session) {
     return impl_->start_prefill_lane(lane, PreparedPromptAccess::take(std::move(prompt)),
-                                     std::move(plan), transient);
+                                     std::move(plan), transient, output_session);
 }
 
 template <>
@@ -219,6 +220,11 @@ GenerationTimings Program<Variant>::generation_timings_lane(std::uint32_t lane) 
 template <>
 const SpeculativeStats& Program<Variant>::speculative_stats_lane(std::uint32_t lane) const noexcept {
     return impl_->speculative_stats_lane(lane);
+}
+
+template <>
+SpeculativeBackend Program<Variant>::speculative_backend() const noexcept {
+    return impl_->speculative_backend();
 }
 
 template <>

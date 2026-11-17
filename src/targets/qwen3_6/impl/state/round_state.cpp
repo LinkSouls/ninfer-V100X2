@@ -71,6 +71,10 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
             add_tensor(builder, DType::BF16,
                        {spec.hidden, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
                        "ordinary decode hidden");
+        ordinary.mask_words = add_tensor(
+            builder, DType::I32,
+            {spec.mask_words, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
+            "ordinary decode token mask words");
     }
     layout.token      = add_tensor(builder, DType::I32, {1}, "step token");
     layout.pos        = add_tensor(builder, DType::I32, {1}, "step position");
@@ -117,6 +121,7 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
                             DType::I32, {count});
     logits         = layout.logits.bind(backing);
     hidden         = layout.hidden.bind(backing);
+    mask_words     = layout.mask_words.bind(backing);
 }
 
 void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layout) {
@@ -177,6 +182,13 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                                               "MTP decode autoregressive rope positions");
         decode.ar_valid_columns  = add_tensor(builder, DType::I32, {batch, ar_steps},
                                               "MTP decode autoregressive valid columns");
+        decode.mask_words = add_tensor(
+            builder, DType::I32,
+            {checked_i32(static_cast<std::uint64_t>(columns) * layout.spec.mask_words,
+                         "MTP decode mask width exceeds int32"),
+             batch},
+            "MTP decode token mask words");
+        decode.mask_words_per_position = layout.spec.mask_words;
     }
     if (layout.spec.enable_dflash) {
         layout.dflash_prefill.emplace().produced_count = i32(1, "DFlash prefill produced count");
@@ -286,8 +298,14 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     ar_positions               = layout.ar_positions.bind(backing);
     ar_rope_positions          = layout.ar_rope_positions.bind(backing);
     ar_valid_columns           = layout.ar_valid_columns.bind(backing);
+    mask_words               = layout.mask_words.bind(backing);
     if (ar_positions.ne[0] != batch || ar_positions.ne[1] != steps) {
         throw std::logic_error("MTP decode AR layout does not match its configured dimensions");
+    }
+    if (mask_words.ne[0] != static_cast<std::int32_t>(static_cast<std::uint64_t>(width) *
+                                                  layout.mask_words_per_position) ||
+        mask_words.ne[1] != batch) {
+        throw std::logic_error("MTP decode mask layout does not match its configured dimensions");
     }
 }
 

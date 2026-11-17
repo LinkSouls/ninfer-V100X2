@@ -50,6 +50,12 @@ public:
         return default_stop_token_ids_;
     }
 
+    [[nodiscard]] std::size_t token_domain() const noexcept { return id_to_token_.size(); }
+
+    // Byte spelling per token id for output-constraint grammar compilation: id i maps to the
+    // decoded bytes of token i (special markers retained).
+    [[nodiscard]] std::vector<std::string> constraint_vocabulary(std::size_t domain) const;
+
     [[nodiscard]] bool is_special_token(int id) const noexcept;
     [[nodiscard]] bool is_valid_token(int id) const noexcept;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;

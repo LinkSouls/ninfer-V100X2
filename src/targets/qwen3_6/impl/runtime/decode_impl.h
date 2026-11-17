@@ -3,6 +3,8 @@
 
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
+#include "ninfer/ops/token_mask.h"
+#include "ninfer/targets/qwen3_6/round_state.h"
 
 #include <optional>
 #include <stdexcept>
@@ -53,6 +55,29 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
                                    envelope, hidden, logits);
         ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
+        // Output-constraint step: stage this round's per-row mask words and forbid the disallowed
+        // tokens before sampling. Unconstrained rows carry an all-ones mask (a bit-identical
+        // no-op), so the op stays unconditional and the captured graph structure is invariant
+        // across constrained and unconstrained rounds. state.token_mask_words is a program-owned
+        // pinned buffer that outlives every graph, the same contract as the ingress upload.
+        if (state.token_mask_words == nullptr) {
+            throw std::logic_error("ordinary decode batch is missing its mask-word staging");
+        }
+        {
+            Tensor mask_view = ordinary.mask_words.slice(1, 0, batch_size);
+            const std::int32_t mask_words = mask_view.ne[0];
+            if (mask_words != (logits.ne[0] + 31) / 32) {
+                throw std::logic_error("ordinary decode mask width does not cover the logits vocabulary");
+            }
+            CUDA_CHECK(cudaMemcpyAsync(mask_view.data, state.token_mask_words,
+                                       static_cast<std::size_t>(batch_size) *
+                                           static_cast<std::size_t>(mask_words) *
+                                           sizeof(std::uint32_t),
+                                       cudaMemcpyHostToDevice, state.execution.device.stream));
+            ops::apply_token_mask_columns(
+                logits, Tensor(mask_view.data, DType::I32, {batch_size, mask_words, 1, 1}),
+                state.execution.device.stream);
+        }
         ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,
                     ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,

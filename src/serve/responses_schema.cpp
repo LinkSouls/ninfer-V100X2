@@ -692,29 +692,82 @@ void reject_server_managed_features(const Json& body) {
             }
         }
     }
-    if (body.contains("text") && !body.at("text").is_null()) {
-        if (!body.at("text").is_object()) { bad_request("text must be an object", "text"); }
-        for (auto it = body.at("text").begin(); it != body.at("text").end(); ++it) {
-            if (it.key() != "format" && !it.value().is_null()) {
-                bad_request("text." + it.key() + " is not supported", "text",
-                            "text_option_not_supported");
-            }
-        }
-        if (body.at("text").contains("format") && !body.at("text").at("format").is_null()) {
-            const Json& format = body.at("text").at("format");
-            if (!format.is_object() || !format.contains("type") || !format.at("type").is_string() ||
-                format.at("type").get<std::string>() != "text") {
-                bad_request("only text.format {type:'text'} is supported", "text",
-                            "structured_outputs_not_supported");
-            }
-            for (auto it = format.begin(); it != format.end(); ++it) {
-                if (it.key() != "type") {
-                    bad_request("only text.format {type:'text'} is supported", "text",
-                                "structured_outputs_not_supported");
-                }
-            }
+    }
+
+// Structured-output contract for the Responses API (p7, design D8): `text.format`
+// carries the output constraint. `{type:"text"}` (or an absent/null `text`) leaves
+// sampling unconstrained; `json_object` and `json_schema` map to the same
+// OutputConstraint kinds as the Chat `response_format`. Bad type values, mistyped
+// optional fields and unknown fields are 400 with the `text.format...` param path.
+void parse_text_format(const Json& body, GenerationRequest& out) {
+    if (!body.contains("text") || body.at("text").is_null()) { return; }
+    const Json& text = body.at("text");
+    if (!text.is_object()) { bad_request("text must be an object", "text"); }
+    for (auto it = text.begin(); it != text.end(); ++it) {
+        if (it.key() != "format" && !it.value().is_null()) {
+            bad_request("text." + it.key() + " is not supported", "text",
+                        "text_option_not_supported");
         }
     }
+    if (!text.contains("format") || text.at("format").is_null()) { return; }
+    const Json& format = text.at("format");
+    if (!format.is_object()) {
+        bad_request("text.format must be an object", "text.format",
+                    "structured_outputs_not_supported");
+    }
+    if (!format.contains("type") || !format.at("type").is_string()) {
+        bad_request("text.format.type is required", "text.format.type",
+                    "structured_outputs_not_supported");
+    }
+    const std::string type = format.at("type").get<std::string>();
+    if (type == "text") {
+        for (auto it = format.begin(); it != format.end(); ++it) {
+            if (it.key() != "type") {
+                bad_request("only text.format {type:'text'} is supported", "text.format",
+                            "structured_outputs_not_supported");
+            }
+        }
+        return;
+    }
+    if (type == "json_object") {
+        for (auto it = format.begin(); it != format.end(); ++it) {
+            if (it.key() != "type") {
+                bad_request("text.format json_object must not carry extra fields",
+                            "text.format." + it.key(), "structured_outputs_not_supported");
+            }
+        }
+        out.constraint = ninfer::OutputConstraint::json_object();
+        return;
+    }
+    if (type == "json_schema") {
+        for (auto it = format.begin(); it != format.end(); ++it) {
+            if (it.key() != "type" && it.key() != "schema" && it.key() != "name" &&
+                it.key() != "description" && it.key() != "strict") {
+                bad_request("text.format has unsupported field: " + it.key(),
+                            "text.format." + it.key(), "structured_outputs_not_supported");
+            }
+        }
+        if (!format.contains("schema") || !format.at("schema").is_object()) {
+            bad_request("text.format json_schema requires a schema object", "text.format.schema",
+                        "structured_outputs_not_supported");
+        }
+        if (format.contains("name") && !format.at("name").is_string()) {
+            bad_request("text.format.name must be a string", "text.format.name",
+                        "structured_outputs_not_supported");
+        }
+        if (format.contains("description") && !format.at("description").is_string()) {
+            bad_request("text.format.description must be a string", "text.format.description",
+                        "structured_outputs_not_supported");
+        }
+        if (format.contains("strict") && !format.at("strict").is_boolean()) {
+            bad_request("text.format.strict must be a boolean", "text.format.strict",
+                        "structured_outputs_not_supported");
+        }
+        out.constraint = ninfer::OutputConstraint::json_schema(format.at("schema").dump());
+        return;
+    }
+    bad_request("unsupported text.format type: " + type, "text.format.type",
+                "structured_outputs_not_supported");
 }
 
 ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limits) {
@@ -757,6 +810,7 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     validate_metadata(body, out);
     parse_tools(body, out);
     parse_tool_choice(body, out);
+    parse_text_format(body, out.generation);
     parse_reasoning(body, out);
     out.generation.preserve_thinking = parse_openai_preserve_thinking(body);
 

@@ -30,6 +30,27 @@ std::string normalize_nfc(std::string_view text) {
     return normalized;
 }
 
+CodepointSpan utf8_codepoint_at(std::string_view text, std::size_t offset,
+                                std::string_view context) {
+    if (offset >= text.size()) {
+        throw std::out_of_range("UTF-8 codepoint offset exceeds " + std::string(context));
+    }
+    const auto first = static_cast<unsigned char>(text[offset]);
+    if (first < 0x80U) { return {first, offset, 1}; }
+    utf8proc_int32_t codepoint = 0;
+    const utf8proc_ssize_t length =
+        utf8proc_iterate(reinterpret_cast<const utf8proc_uint8_t*>(text.data() + offset),
+                         static_cast<utf8proc_ssize_t>(text.size() - offset), &codepoint);
+    if (length < 0) {
+        throw std::invalid_argument("invalid UTF-8 in " + std::string(context) + ": " +
+                                    utf8proc_errmsg(length));
+    }
+    if (length == 0) {
+        throw std::invalid_argument("truncated UTF-8 sequence in " + std::string(context));
+    }
+    return CodepointSpan{codepoint, offset, static_cast<std::size_t>(length)};
+}
+
 std::vector<CodepointSpan> utf8_codepoints(std::string_view text, std::string_view context) {
     std::vector<CodepointSpan> codepoints;
     for (std::size_t offset = 0; offset < text.size();) {

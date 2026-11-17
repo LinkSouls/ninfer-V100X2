@@ -108,18 +108,18 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
     base->capture_prefix_checkpoints = options.allow_prefix_reuse && prompt.identity.reusable &&
         !prompt.has_media() && ram_kv.gpu_tokens == 0 &&
-        speculative_backend != SpeculativeBackend::DFlash &&
+        speculative_backend_ != SpeculativeBackend::DFlash &&
         prefix_checkpoint_bytes() <= kPrefixCheckpointBudget / max_concurrency;
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
                                            : base->summary.effective_output_tokens - 1U);
     base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
-    if (speculative_backend == SpeculativeBackend::Mtp) {
+    if (speculative_backend_ == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
         base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
-    } else if (speculative_backend == SpeculativeBackend::DFlash && backend_kv_cache() != nullptr) {
+    } else if (speculative_backend_ == SpeculativeBackend::DFlash && backend_kv_cache() != nullptr) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
     if (ram_kv.gpu_tokens != 0) {
@@ -144,7 +144,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             const auto first = static_cast<std::uint32_t>(item.scatter_indices.front());
             const auto last  = static_cast<std::uint32_t>(item.scatter_indices.back());
             const std::uint32_t begin =
-                speculative_backend == SpeculativeBackend::Mtp && first != 0 ? first - 1 : first;
+                speculative_backend_ == SpeculativeBackend::Mtp && first != 0 ? first - 1 : first;
             const std::uint32_t end = last + 1;
             if (begin < previous_end) {
                 throw std::invalid_argument("vision item consumer spans overlap");
@@ -205,7 +205,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
 
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
         const bool dflash_append_ready =
-            speculative_backend != SpeculativeBackend::DFlash ||
+            speculative_backend_ != SpeculativeBackend::DFlash ||
             sequence.dflash_context_frontier == sequence.execution_frontier;
         if (sequence.execution_frontier != 0 && dflash_append_ready &&
             qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
@@ -223,7 +223,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         // A shorter/edited prompt can still claim any retained complete state image.
         // Prefer the longest matching frontier, not the checkpoint's original purpose.
         if (!prompt.has_media() && ram_kv.gpu_tokens == 0 &&
-            speculative_backend != SpeculativeBackend::DFlash) {
+            speculative_backend_ != SpeculativeBackend::DFlash) {
             for (const auto& checkpoint : sequence.prefix_checkpoints) {
                 if (checkpoint.frontier > plan->reuse_base &&
                     qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
@@ -285,7 +285,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
-    if (speculative_backend == SpeculativeBackend::Mtp) {
+    if (speculative_backend_ == SpeculativeBackend::Mtp) {
         const bool append_ready =
             plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
             decoder->mtp_cache() != nullptr &&
@@ -303,7 +303,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     }
 
     if (is_rewrite_checkpoint_restore(plan->reuse) &&
-        speculative_backend == SpeculativeBackend::DFlash &&
+        speculative_backend_ == SpeculativeBackend::DFlash &&
         (!dflash || !sequence.kv ||
          dflash->full.has_value() != sequence.kv->backend.has_value() ||
          sequence.dflash_context_frontier < plan->reuse_base)) {
@@ -334,7 +334,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     }
 
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
-    if (speculative_backend == SpeculativeBackend::Mtp) {
+    if (speculative_backend_ == SpeculativeBackend::Mtp) {
         if (plan->reuse == ReusePath::FullReset) {
             plan->prepare_mtp = true;
         } else if (plan->reuse == ReusePath::AppendAtFrontier) {

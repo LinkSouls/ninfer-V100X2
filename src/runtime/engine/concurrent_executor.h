@@ -158,6 +158,18 @@ public:
         try {
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
                                                                          options.output);
+            // Backend capability guard (design D7): DFlash draft tokens are produced device-side
+            // inside the captured graph, so its verify step cannot take host-computed grammar
+            // masks. Reject constrained requests on a DFlash instance at the submission boundary
+            // instead of silently generating unconstrained output.
+            if (output.constrained() &&
+                instance_.program->speculative_backend() == SpeculativeBackend::DFlash) {
+                throw RequestError(
+                    RequestErrorKind::ConstraintUnsupportedByBackend,
+                    "output constraints are not supported by the DFlash speculative backend; "
+                    "use the MTP or ordinary backend",
+                    "response_format", RequestErrorSource::OutputConstraint);
+            }
             // CPU media work must not hold the device/execution mutex or stall active decode.
             const double host_vision_seconds = instance_.program->prepare_media(
                 prompt, preparation);
@@ -902,7 +914,8 @@ private:
             publish_runtime_stats();
             target_started                = true;
             const PrefillStepResult first = instance_.program->start_prefill_lane(
-                lane, std::move(request->prompt), std::move(selected_plan), transient);
+                lane, std::move(request->prompt), std::move(selected_plan), transient,
+                &request->output);
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }

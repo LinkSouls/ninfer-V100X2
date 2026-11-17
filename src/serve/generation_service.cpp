@@ -77,6 +77,28 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
         error.type   = "server_error";
         error.code   = "service_unavailable";
         break;
+    case ninfer::RequestErrorKind::ConstraintUnsupportedByBackend:
+        error.param = exception.pointer().empty() ? "response_format" : exception.pointer();
+        error.status = 400;
+        error.code   = "constraint_unsupported_by_backend";
+        break;
+    case ninfer::RequestErrorKind::InvalidGrammar:
+    case ninfer::RequestErrorKind::InvalidChoice:
+    case ninfer::RequestErrorKind::InvalidRegex:
+    case ninfer::RequestErrorKind::InvalidJsonSchema:
+    case ninfer::RequestErrorKind::UnsupportedJsonSchema:
+    case ninfer::RequestErrorKind::UnsatisfiableJsonSchema:
+    case ninfer::RequestErrorKind::InvalidToolConstraint:
+        // A constraint that cannot be compiled rejects the request; the service stays up.
+        error.param = exception.pointer().empty() ? "response_format" : exception.pointer();
+        error.status = 400;
+        error.code   = "invalid_output_constraint";
+        break;
+    case ninfer::RequestErrorKind::ConstraintDeadEnd:
+        error.param = exception.pointer().empty() ? "response_format" : exception.pointer();
+        error.status = 400;
+        error.code   = "constraint_dead_end";
+        break;
     }
     return error;
 }
