@@ -125,7 +125,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--rope native|yarn] [--yarn-factor F] [--yarn-origin O]\n"
            "       [--device N] [--tp 1|2|4] [--pp 1|2] [--pipeline-chunks 1..8] [--devices N,...] [--storage-device N]\n"
-           "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--ram-kv-window N] [--ram-kv-budget-bytes N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"

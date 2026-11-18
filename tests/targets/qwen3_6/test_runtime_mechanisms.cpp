@@ -48,6 +48,9 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
         .attention_head_dim        = 64,
         .kv_dtype                  = dtype,
         .kv_quant_group            = dtype == ninfer::DType::I8 ? q36::kKvQuantGroup : 0,
+        .kv_storage                = dtype == ninfer::DType::I8
+                                         ? ninfer::KvCacheStorage::Int8Group64
+                                         : ninfer::KvCacheStorage::BFloat16,
         .enable_mtp                = mtp,
         .text_physical_page_groups = 5,
         .mtp_physical_page_groups  = mtp ? 4U : 0U,

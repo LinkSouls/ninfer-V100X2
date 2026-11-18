@@ -43,6 +43,7 @@ tools/freq_corpus/fixtures/*
 .DS_Store
 profiles/
 .chatgpt/
+.claude/
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json

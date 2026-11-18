@@ -68,7 +68,7 @@
 
 #include "ops/common/volta_mma.cuh"
 #include "ops/kernel/gqa_attention_decode.cuh"
-#include "ops/kernel/gqa_attention_kv_quant.cuh"
+#include "ops/kernel/gqa_attention_kv_g64_codec.cuh"
 #include "ops/kernel/hadamard_d256.cuh"
 
 #include <cuda_bf16.h>
@@ -98,10 +98,12 @@ __device__ __forceinline__ void volta_attention_pv_fp32(float (&d)[8], const hal
 }
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
-          typename CacheInput, bool SharedSoftmax = false, bool Fp32Pv = false>
+          typename CacheInput, bool SharedSoftmax = false, bool Fp32Pv = false,
+          typename KvCodec = KvI8G64>
 __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_volta_partial_i8_kernel(
-    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
-    std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
+    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
+    typename KvCodec::Code* cache_k, typename KvCodec::Code* cache_v,
+    typename KvCodec::KScale* cache_k_scale, typename KvCodec::VScale* cache_v_scale,
     const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
@@ -121,7 +123,6 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
     constexpr int DSlice        = D / DimSplit;    // this warp's PV output width
     constexpr int DChunksLocal  = DSlice / 8;       // this warp's resident accumulator chunks
     constexpr int PageIds       = 64;
-    constexpr int Groups        = D / kGqaKvQuantGroup; // quant groups per key row
     constexpr bool InlineQK = (Geometry::QHeads == 12 || Geometry::QHeads == 6) && TokenTile == 5 &&
                               SharedSoftmax && !Fp32Pv;
     constexpr bool PrefetchKv = (Geometry::QHeads == 12 || Geometry::QHeads == 6) &&
@@ -130,9 +131,8 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
-    static_assert(D % kGqaKvQuantGroup == 0, "head dim must divide into whole quant groups");
-    static_assert(kGqaKvQuantGroup % 8 == 0,
-                  "an 8-wide staging chunk must sit inside one quant group, so it needs one scale");
+    // The quantize_row policy owns the per-group scale/code width; the 8-wide staging chunk below
+    // must sit inside one group, which holds for both the group-64 and group-16 (NVFP4) codecs.
 
     // Declared fp16 (not bf16): Volta's mma.sync.m8n8k4 only accepts fp16 operands. Unlike the
     // bf16 sibling kernel, which lands raw cache bytes here and reinterprets them in place, K/V
@@ -284,35 +284,12 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
             }
             gqa_hadamard_d256_inplace(k_vals, lane);
             gqa_hadamard_d256_inplace(v_vals, lane);
-#pragma unroll
-            for (int grp = 0; grp < Groups; ++grp) {
-                const int d0   = grp * kGqaKvQuantGroup + lane;
-                const int d1   = d0 + 32;
-                const float kv0 = k_vals[2 * grp];
-                const float kv1 = k_vals[2 * grp + 1];
-                const float vv0 = v_vals[2 * grp];
-                const float vv1 = v_vals[2 * grp + 1];
-                float kamax     = warp_max(fmaxf(fabsf(kv0), fabsf(kv1)), FullMask);
-                float vamax     = warp_max(fmaxf(fabsf(vv0), fabsf(vv1)), FullMask);
-                const __half ksh  = __float2half_rn(kamax > 0.0f ? kamax / 127.0f : 0.0f);
-                const __half vsh  = __float2half_rn(vamax > 0.0f ? vamax / 127.0f : 0.0f);
-                const float k_inv  = __half2float(ksh) > 0.0f ? 1.0f / __half2float(ksh) : 0.0f;
-                const float v_inv  = __half2float(vsh) > 0.0f ? 1.0f / __half2float(vsh) : 0.0f;
-                cache_k_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d0, page_offset)] =
-                    gqa_kv_quant_code(kv0, k_inv);
-                cache_k_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d1, page_offset)] =
-                    gqa_kv_quant_code(kv1, k_inv);
-                cache_v_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d0, page_offset)] =
-                    gqa_kv_quant_code(vv0, v_inv);
-                cache_v_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d1, page_offset)] =
-                    gqa_kv_quant_code(vv1, v_inv);
-                if (lane == 0) {
-                    const std::int64_t so =
-                        gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, grp, page_offset);
-                    cache_k_scale[so] = ksh;
-                    cache_v_scale[so] = vsh;
-                }
-            }
+            // Fused per-format quantize: the policy writes the (rotated) row into this codec's
+            // code/scale planes. For the group-64 INT8/FP8 policies this is the original inline
+            // block verbatim (bit-identical to the SIMT append block they share a cache with);
+            // for NVFP4 it packs 2 E2M1/byte + a group-16 E4M3 scale byte.
+            KvCodec::template quantize_row<Geometry>(k_vals, v_vals, physical_page, kv_head, page_offset,
+                                            cache_k, cache_v, cache_k_scale, cache_v_scale);
         }
         __syncthreads();
     }
@@ -386,8 +363,10 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
         // Keep the next tile's packed bytes in registers while the current QK/softmax/PV
         // runs. The qualified five-query TP2 route keeps the same split, QK, softmax
         // and PV order; other widths retain their measured staging schedule.
-        int2 next_k[PrefetchKv ? KvChunks : 1], next_v[PrefetchKv ? KvChunks : 1];
-        half next_ks[PrefetchKv ? KvChunks : 1], next_vs[PrefetchKv ? KvChunks : 1];
+        typename KvCodec::KStagingBuf next_k[PrefetchKv ? KvChunks : 1];
+        typename KvCodec::VStagingBuf next_v[PrefetchKv ? KvChunks : 1];
+        typename KvCodec::KScale next_ks[PrefetchKv ? KvChunks : 1];
+        typename KvCodec::VScale next_vs[PrefetchKv ? KvChunks : 1];
         auto prefetch_kv = [&](int tile) {
 #pragma unroll
             for (int c = 0; c < KvChunks; ++c) {
@@ -395,20 +374,21 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
                 const int key_l = chunk / (D / 8);
                 const int d = (chunk % (D / 8)) * 8;
                 const int key = tile + key_l;
-                next_k[c] = make_int2(0, 0);
-                next_v[c] = make_int2(0, 0);
-                next_ks[c] = __float2half(0.0f);
-                next_vs[c] = __float2half(0.0f);
+                next_k[c] = typename KvCodec::KStagingBuf{};
+                next_v[c] = typename KvCodec::VStagingBuf{};
+                next_ks[c] = typename KvCodec::KScale{};
+                next_vs[c] = typename KvCodec::VScale{};
                 if (key >= split_start && key < split_end) {
                     const int page = physical_pages_s[(key >> kPagedKVPageShift) - first_page];
                     const int offset = key & kPagedKVPageMask;
-                    const auto code = gqa_kv_quant_code_index<Geometry>(page, kv_head, d, offset);
-                    const auto group = gqa_kv_quant_scale_index<Geometry>(
-                        page, kv_head, d / kGqaKvQuantGroup, offset);
-                    next_k[c] = load_vec<int2>(cache_k_i8 + code);
-                    next_v[c] = load_vec<int2>(cache_v_i8 + code);
-                    next_ks[c] = cache_k_scale[group];
-                    next_vs[c] = cache_v_scale[group];
+                    const auto kcode  = KvCodec::template k_code_index<Geometry>(page, kv_head, d, offset);
+                    const auto vcode  = KvCodec::template v_code_index<Geometry>(page, kv_head, d, offset);
+                    const auto kgroup = KvCodec::template k_scale_index<Geometry>(page, kv_head, d, offset);
+                    const auto vgroup = KvCodec::template v_scale_index<Geometry>(page, kv_head, d, offset);
+                    next_k[c] = load_vec<typename KvCodec::KStagingBuf>(cache_k + kcode);
+                    next_v[c] = load_vec<typename KvCodec::VStagingBuf>(cache_v + vcode);
+                    next_ks[c] = cache_k_scale[kgroup];
+                    next_vs[c] = cache_v_scale[vgroup];
                 }
             }
         };
@@ -433,9 +413,9 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
                     const int key_l = chunk / (D / 8);
                     const int d = (chunk % (D / 8)) * 8;
                     store_vec(&k_s[key_l * SmemStride + d],
-                              gqa_kv_dequant_i8x8_f16(next_k[c], next_ks[c]));
+                              KvCodec::k_dequant8(next_k[c], next_ks[c]));
                     store_vec(&v_s[key_l * SmemStride + d],
-                              gqa_kv_dequant_i8x8_f16(next_v[c], next_vs[c]));
+                              KvCodec::v_dequant8(next_v[c], next_vs[c]));
                 }
             } else {
                 for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
@@ -446,14 +426,18 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
                     half* v_dst     = &v_s[key_l * SmemStride + d];
                     if (key >= split_start && key < split_end) {
                         const int page_offset = key & kPagedKVPageMask;
-                        const std::int64_t code_off =
-                            gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d, page_offset);
-                        const std::int64_t scale_off = gqa_kv_quant_scale_index<Geometry>(
-                            physical_page, kv_head, d / kGqaKvQuantGroup, page_offset);
-                        const __half ks = cache_k_scale[scale_off];
-                        const __half vs = cache_v_scale[scale_off];
-                        store_vec(k_dst, gqa_kv_dequant_i8x8_f16_from(&cache_k_i8[code_off], ks));
-                        store_vec(v_dst, gqa_kv_dequant_i8x8_f16_from(&cache_v_i8[code_off], vs));
+                        const std::int64_t k_code_off =
+                            KvCodec::template k_code_index<Geometry>(physical_page, kv_head, d, page_offset);
+                        const std::int64_t v_code_off =
+                            KvCodec::template v_code_index<Geometry>(physical_page, kv_head, d, page_offset);
+                        const std::int64_t k_scale_off = KvCodec::template k_scale_index<Geometry>(
+                            physical_page, kv_head, d, page_offset);
+                        const std::int64_t v_scale_off = KvCodec::template v_scale_index<Geometry>(
+                            physical_page, kv_head, d, page_offset);
+                        const typename KvCodec::KScale ks = cache_k_scale[k_scale_off];
+                        const typename KvCodec::VScale vs = cache_v_scale[v_scale_off];
+                        store_vec(k_dst, KvCodec::k_dequant8_from(&cache_k[k_code_off], ks));
+                        store_vec(v_dst, KvCodec::v_dequant8_from(&cache_v[v_code_off], vs));
                     } else {
                         store_vec(k_dst, make_int4(0, 0, 0, 0));
                         store_vec(v_dst, make_int4(0, 0, 0, 0));

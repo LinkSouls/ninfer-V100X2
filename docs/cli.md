@@ -192,7 +192,7 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--pp 1\|2` | layer-pipeline degree; `2` requires SM70 Qwen3.8 NVFP4/QUASAR, TP1 and Text/None/MTP | `1` |
 | `--pipeline-chunks N` | PP prefill wave of `1..8` chunks; `1` is the serial control | `8` |
 | `--devices A,B` | exactly `tp * pp` distinct CUDA device indices; required for parallel execution | `--device` |
-| `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
+| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage; the quantized values store D256-rotated rows with per-group scales (`fp8` FP8 E4M3 group-64, `nvfp4` 4-bit E2M1 group-16, `k8v4` asymmetric FP8 key / NVFP4 value) | `bf16` |
 | `--prefix-cache-tokens N` | historical host KV budget in unique page-rounded Main Text tokens; `0` disables historical branches, preserving current GPU-prefix reuse | `384000` |
 | `--volta-long-attention` | experimental complete-history attention arithmetic; SM70 27B TP2/TP4, PP1, 1–8 active requests, INT8 KV, Text/None/MTP (Vision on TP2 only); excludes RAM-KV; floating-point association and output IDs may change | off |
 | `--volta-fast-decode` | experimental QUASAR SM70 TP2/TP4 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |
@@ -324,6 +324,13 @@ because a BF16 pool at that window does not fit two RTX 5090s. The 1,048,576-tok
 with `--spec mtp --draft-tokens 3`. A full-ceiling prefill takes about 19 minutes on the measured
 host. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
+Three further quantized storage formats trade precision for footprint: `fp8` (FP8 E4M3 group-64,
+byte-identical in size to `int8`), `nvfp4` (4-bit E2M1 codes in groups of 16, 0.55x the `int8`
+footprint), and `k8v4` (asymmetric: FP8 key plane, NVFP4 value plane, 0.77x the `int8`
+footprint). All three keep the same paged layout and the D256 rotation coordinate contract, and
+are served by every KV-reading path, including the Volta flash prefill route; the cost is
+numerical, settled by the per-format quality comparisons, not by capacity. Group and scale
+semantics are documented in `docs/maintainer/paged-kv-cache.md`.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
 memory, and directly chooses the largest legal page capacity for the complete enabled runtime

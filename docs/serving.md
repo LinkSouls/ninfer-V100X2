@@ -112,6 +112,16 @@ It supports Text, None/MTP, prefix reuse and optional sparse RAM-KV; Vision, DFl
 and concurrency above one are rejected. Both prefill and decode use PP2 throughout
 the resident Engine's lifetime; there is no request-time TP/PP switch.
 
+The KV pool can be shrunk with the quantized storage formats: `--kv-dtype fp8` (FP8 E4M3
+group-64) keeps the `int8` footprint, `k8v4` (asymmetric FP8 key / NVFP4 value) is 0.77x it, and
+`nvfp4` (4-bit E2M1 group-16) is 0.55x it (16,896 / 13,056 / 9,216 KV bytes per token per GPU at
+the production TP2 27B profile). At a fixed `--kv-capacity` the smaller footprint frees VRAM for
+weights and activations; grown to fill the same budget it holds ~1.29x (k8v4) / ~1.83x (nvfp4) the
+tokens of the `int8` pool. All three keep the same paged layout and D256 rotation coordinate
+contract and are served by every attention path, including the Volta flash prefill route; the
+trade-off is numerical, settled by the per-format quality comparison. See
+`docs/maintainer/paged-kv-cache.md` for the group and scale semantics.
+
 Compatible-prefix reuse is enabled by default at both TP widths, including `--tp 2 --spec mtp`.
 The visual-prefix bridge test fails on this two-card SM70 host; the difference has not been
 established as either a state bug or floating-point path variation. For experimental TP2 Vision,
@@ -781,7 +791,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
-| `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
+| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage; the quantized values store D256-rotated rows with per-group scales (`fp8` FP8 E4M3 group-64, `nvfp4` 4-bit E2M1 group-16, `k8v4` asymmetric FP8 key / NVFP4 value) | `bf16` |
 | `--prefix-cache-tokens N` | historical host KV budget in unique page-rounded Main Text tokens; `0` disables historical branches, preserving current GPU-prefix reuse | `384000` |
 | `--volta-long-attention` | startup-fixed experimental complete-history attention; SM70 27B TP2/TP4, PP1, experimental concurrency 1–8, INT8 KV, Text/None/MTP (Vision on TP2 only); excludes RAM-KV; floating-point association and output IDs may change | off |
 | `--volta-fast-decode` | experimental QUASAR SM70 TP2/TP4 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |

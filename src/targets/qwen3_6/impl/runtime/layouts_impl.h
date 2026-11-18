@@ -128,6 +128,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .attention_head_dim        = TextConfig::head_dim,
                      .kv_dtype                  = plan.kv_dtype,
                      .kv_quant_group            = plan.kv_quant_group,
+                     .kv_storage                = plan.kv_storage,
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
@@ -831,6 +832,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->volta_long_attention = inputs.volta_long_attention;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
+    impl->kv_storage          = inputs.kv_storage;
     impl->persistent          = persistent_layout(*impl);
     if (inputs.ram_kv.gpu_tokens != 0) {
         std::uint64_t archive = 0;
@@ -945,6 +947,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile) {
     const std::uint32_t effective_max_context = validate_target_options(device, options);
 
+    // p4 task 0.2: the KV storage format is the dispatch key; the code dtype and quant group the
+    // persistent layout consumes derive from it.
+    const auto kv_geom = kv_cache_plane_geometry(options.kv_cache, TextConfig::head_dim);
+
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
@@ -953,8 +959,9 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
-        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
+        .kv_dtype       = kv_geom.k_code,
+        .kv_quant_group = kv_geom.k_group,
+        .kv_storage     = options.kv_cache,
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
         .rope_mode      = options.rope_mode,

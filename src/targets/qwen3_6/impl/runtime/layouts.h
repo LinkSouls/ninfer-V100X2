@@ -69,6 +69,7 @@ struct SequencePlanningInputs {
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
+    KvCacheStorage kv_storage              = KvCacheStorage::BFloat16; // p4 dispatch key (0.2)
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     // Rotary regime. Nothing in the persistent or workspace layout depends on these:
@@ -111,6 +112,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
+    KvCacheStorage kv_storage              = KvCacheStorage::BFloat16; // p4 dispatch key (0.2)
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     // See SequencePlanningInputs: rope regime carried through the plan, layout-neutral.

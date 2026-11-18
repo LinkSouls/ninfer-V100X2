@@ -124,7 +124,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash --draft-tokens N]"
            "[--ram-kv-window N] [--ram-kv-budget-bytes N] "
            "[--default-max-tokens N] [--max-output-tokens N] "
            "[--vision] [--vision-device gpu|cpu] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "

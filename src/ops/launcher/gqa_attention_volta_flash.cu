@@ -24,6 +24,11 @@
 #include "core/tensor.h"
 #include "ops/kernel/gqa_attention_geometry.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
+#include "ops/kernel/kv_cache_fp8_g64_codec.cuh"      // ninfer::kv_fp8 (E4M3 encode/decode)
+#include "ops/kernel/kv_cache_nvfp4_g16_codec.cuh"    // ninfer::kv_nvfp4 (E2M1/E4M3)
+#include "ops/kernel/gqa_attention_kv_g64_codec.cuh"   // KvFp8G64 codec policy
+#include "ops/kernel/gqa_attention_nvfp4_g16_codec.cuh" // KvNvfp4G16 codec policy
+#include "ops/kernel/gqa_attention_k8v4_codec.cuh"     // KvK8V4 codec policy
 #include "ops/kernel/hadamard_d256.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/launcher/gqa_attention.h"
@@ -212,6 +217,58 @@ __launch_bounds__(256) __global__ void volta_flash_append_kv_i8_kernel(
     }
 }
 
+// The codec policies address their code/scale planes through a Geometry's KVHeads member; the
+// flash tiling only carries the head count, so this minimal adapter feeds their index/quantize
+// helpers (KvFp8G64 / KvNvfp4G16 / KvK8V4) without pulling in a full registered geometry.
+template <int NHeads>
+struct FlashGeo {
+    static constexpr int KVHeads = NHeads;
+};
+
+// FP8/NVFP4/K8V4 append: the same warp-per-row D256 structure as the INT8 kernel above (one warp
+// rotates and quantizes one (token, kv-head) row in registers), but the per-format quantize is
+// delegated to the codec policy's quantize_row -- K8V4 splits K->FP8 g64 / V->NVFP4 g16, the
+// symmetric policies do both planes identically. The code/scale layout and counts come from the
+// policy's index functions, so they match that format's layout plan (kv_cache_plane_geometry).
+// Quant stays fused into the append (no standalone kernel); the BF16 and INT8 branches above are
+// untouched, so those formats stay bit-identical.
+template <int kKVHeads, typename KvCodec>
+__launch_bounds__(256) __global__ void volta_flash_append_kv_codec_kernel(
+        const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+        const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ table_rows,
+        typename KvCodec::Code* __restrict__ k_pages, typename KvCodec::Code* __restrict__ v_pages,
+        typename KvCodec::KScale* __restrict__ k_scales, typename KvCodec::VScale* __restrict__ v_scales,
+        const std::int32_t* __restrict__ block_tables, int logical_pages, int width) {
+    constexpr int kWarps = 8;
+    const int warp       = static_cast<int>(threadIdx.x) >> 5;
+    const int lane       = static_cast<int>(threadIdx.x) & 31;
+    const int unit       = static_cast<int>(blockIdx.x) * kWarps + warp;
+    const int units      = width * kKVHeads;
+    if (unit >= units) { return; }
+
+    const int h     = unit % kKVHeads;
+    const int token = unit / kKVHeads;
+    const std::int64_t row_base = kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * token);
+    float k_vals[8], v_vals[8];
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int d = lane + 32 * r;
+        k_vals[r]   = __bfloat162float(k[row_base + d]);
+        v_vals[r]   = __bfloat162float(v[row_base + d]);
+    }
+    gqa_hadamard_d256_inplace(k_vals, lane);
+    gqa_hadamard_d256_inplace(v_vals, lane);
+
+    const std::int32_t* block_table = select_block_table(block_tables, table_rows, logical_pages);
+    const int position              = positions[token];
+    int physical_page = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+    physical_page     = __shfl_sync(0xffffffffu, physical_page, 0);
+    const int page_offset = position & kPagedKVPageMask;
+
+    KvCodec::template quantize_row<FlashGeo<kKVHeads>>(k_vals, v_vals, physical_page, h, page_offset,
+                                              k_pages, v_pages, k_scales, v_scales);
+}
+
 // Paged BF16 -> contiguous FP16, one launch per layer over the whole visible key
 // range. ~50 MB of traffic per layer at 12K against the seconds the chunked route
 // spends re-walking the key range; see the cost note in the plan.
@@ -274,6 +331,119 @@ __global__ void volta_flash_gather_kv_i8_kernel(
         paged_kv_element_offset<kGqaKvQuantGroups, kKVHeads>(block_table, h, key, group);
     k_out[dst] = __float2half(static_cast<float>(k_pages[code]) * __half2float(k_scales[scale]));
     v_out[dst] = __float2half(static_cast<float>(v_pages[code]) * __half2float(v_scales[scale]));
+}
+
+// Paged FP8-E4M3-G64 -> contiguous FP16. Both planes share the INT8 group-64 geometry (one code
+// byte per rotated dimension + one FP16 scale per 64); only the code<->value arithmetic differs:
+// value = E4M3(code) * scale, matching the validated FP8 mma staging bit-for-bit.
+template <int kKVHeads>
+__global__ void volta_flash_gather_kv_fp8_kernel(
+        const std::uint8_t* __restrict__ k_pages, const std::uint8_t* __restrict__ v_pages,
+        const half* __restrict__ k_scales, const half* __restrict__ v_scales,
+        const std::int32_t* __restrict__ block_tables, const std::int32_t* __restrict__ table_rows,
+        int logical_pages, half* __restrict__ k_out, half* __restrict__ v_out, int n_kv,
+        int n_kv_padded) {
+    const int key = blockIdx.x;
+    const int h   = blockIdx.y;
+    const int d   = threadIdx.x;
+    if (key >= n_kv_padded) { return; }
+
+    const std::int64_t dst =
+        static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * key);
+    if (key >= n_kv) {
+        k_out[dst] = __float2half(0.0f);
+        v_out[dst] = __float2half(0.0f);
+        return;
+    }
+
+    const std::int32_t* block_table = select_block_table(block_tables, table_rows, logical_pages);
+    const std::int64_t code = paged_kv_element_offset<kHeadDim, kKVHeads>(block_table, h, key, d);
+    const int group         = d / kGqaKvQuantGroup;
+    const std::int64_t scale =
+        paged_kv_element_offset<kGqaKvQuantGroups, kKVHeads>(block_table, h, key, group);
+    k_out[dst] = __float2half_rn(
+        __fmul_rn(ninfer::kv_fp8::e4m3_decode(k_pages[code]), __half2float(k_scales[scale])));
+    v_out[dst] = __float2half_rn(
+        __fmul_rn(ninfer::kv_fp8::e4m3_decode(v_pages[code]), __half2float(v_scales[scale])));
+}
+
+// Paged NVFP4-G16 -> contiguous FP16. Each plane packs two E2M1 codes per byte (dimension d lives
+// in byte d/2, nibble d&1) plus one E4M3 scale byte per 16; value = E2M1(nibble) * E4M3(scale),
+// the same decode the validated NVFP4 mma staging uses.
+template <int kKVHeads>
+__global__ void volta_flash_gather_kv_nvfp4_kernel(
+        const std::uint8_t* __restrict__ k_pages, const std::uint8_t* __restrict__ v_pages,
+        const std::uint8_t* __restrict__ k_scales, const std::uint8_t* __restrict__ v_scales,
+        const std::int32_t* __restrict__ block_tables, const std::int32_t* __restrict__ table_rows,
+        int logical_pages, half* __restrict__ k_out, half* __restrict__ v_out, int n_kv,
+        int n_kv_padded) {
+    const int key = blockIdx.x;
+    const int h   = blockIdx.y;
+    const int d   = threadIdx.x;
+    if (key >= n_kv_padded) { return; }
+
+    const std::int64_t dst =
+        static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * key);
+    if (key >= n_kv) {
+        k_out[dst] = __float2half(0.0f);
+        v_out[dst] = __float2half(0.0f);
+        return;
+    }
+
+    const std::int32_t* block_table = select_block_table(block_tables, table_rows, logical_pages);
+    const std::int64_t code =
+        paged_kv_element_offset<kGqaNvfp4CodeExt, kKVHeads>(block_table, h, key, d / 2);
+    const int group16 = d / kGqaNvfp4Group;
+    const std::int64_t scale =
+        paged_kv_element_offset<kGqaNvfp4ScaleExt, kKVHeads>(block_table, h, key, group16);
+    const float ksf = ninfer::kv_nvfp4::decode_nvfp4_e4m3(k_scales[scale]);
+    const float2 kc = ninfer::kv_nvfp4::decode_nvfp4_e2m1_byte(k_pages[code]);
+    k_out[dst] = __float2half_rn(__fmul_rn((d & 1) ? kc.y : kc.x, ksf));
+    const float vsf = ninfer::kv_nvfp4::decode_nvfp4_e4m3(v_scales[scale]);
+    const float2 vc = ninfer::kv_nvfp4::decode_nvfp4_e2m1_byte(v_pages[code]);
+    v_out[dst] = __float2half_rn(__fmul_rn((d & 1) ? vc.y : vc.x, vsf));
+}
+
+// Paged K8V4 (asymmetric) -> contiguous FP16. The key plane is FP8 E4M3 group-64 (code byte at
+// dimension d, FP16 scale at d/64) and the value plane is NVFP4 group-16 (packed byte at d/2,
+// E4M3 scale byte at d/16); each plane dequantizes with its own codec, independently.
+template <int kKVHeads>
+__global__ void volta_flash_gather_kv_k8v4_kernel(
+        const std::uint8_t* __restrict__ k_pages, const std::uint8_t* __restrict__ v_pages,
+        const half* __restrict__ k_scales, const std::uint8_t* __restrict__ v_scales,
+        const std::int32_t* __restrict__ block_tables, const std::int32_t* __restrict__ table_rows,
+        int logical_pages, half* __restrict__ k_out, half* __restrict__ v_out, int n_kv,
+        int n_kv_padded) {
+    const int key = blockIdx.x;
+    const int h   = blockIdx.y;
+    const int d   = threadIdx.x;
+    if (key >= n_kv_padded) { return; }
+
+    const std::int64_t dst =
+        static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * key);
+    if (key >= n_kv) {
+        k_out[dst] = __float2half(0.0f);
+        v_out[dst] = __float2half(0.0f);
+        return;
+    }
+
+    const std::int32_t* block_table = select_block_table(block_tables, table_rows, logical_pages);
+    // Key plane: FP8 E4M3 group-64.
+    const std::int64_t kcode = paged_kv_element_offset<kHeadDim, kKVHeads>(block_table, h, key, d);
+    const int kgroup         = d / kGqaKvQuantGroup;
+    const std::int64_t kscale =
+        paged_kv_element_offset<kGqaKvQuantGroups, kKVHeads>(block_table, h, key, kgroup);
+    k_out[dst] = __float2half_rn(
+        __fmul_rn(ninfer::kv_fp8::e4m3_decode(k_pages[kcode]), __half2float(k_scales[kscale])));
+    // Value plane: NVFP4 group-16.
+    const std::int64_t vcode =
+        paged_kv_element_offset<kGqaNvfp4CodeExt, kKVHeads>(block_table, h, key, d / 2);
+    const int vgroup16 = d / kGqaNvfp4Group;
+    const std::int64_t vscale =
+        paged_kv_element_offset<kGqaNvfp4ScaleExt, kKVHeads>(block_table, h, key, vgroup16);
+    const float vsf = ninfer::kv_nvfp4::decode_nvfp4_e4m3(v_scales[vscale]);
+    const float2 vc = ninfer::kv_nvfp4::decode_nvfp4_e2m1_byte(v_pages[vcode]);
+    v_out[dst] = __float2half_rn(__fmul_rn((d & 1) ? vc.y : vc.x, vsf));
 }
 
 // BF16 [256, QHeads, T] -> FP32, same element order (the kernel's Q and ninfer's q
@@ -526,6 +696,13 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     auto* rows         = static_cast<const std::int32_t*>(table_rows.data);
     auto* position_ptr = static_cast<const std::int32_t*>(positions.data);
 
+    // Every quantized storage format (INT8/FP8/NVFP4/K8V4) carries the D256 rotation on its K/V
+    // rows, so Q staging must apply the same rotation and the output epilogue must undo it exactly
+    // once; BF16 leaves both untouched. The storage field is the p4 dispatch key (0.2): BF16 and
+    // INT8 keep their original elementwise/INT8 branches bit-identical, the new formats take the
+    // codec-dispatched branches below.
+    const bool rotated = cache.storage != KvCacheStorage::BFloat16;
+
     // 1. Append this call's K/V for the whole width.
     if (cache.dtype == DType::I8) {
         constexpr int kWarpsPerBlock = 8;
@@ -537,6 +714,43 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
             static_cast<std::int8_t*>(cache.v_pages.data),
             static_cast<half*>(cache.k_scale_pages.data),
             static_cast<half*>(cache.v_scale_pages.data), block_tables, logical_pages, width);
+    } else if (cache.dtype == DType::FP8_E4M3FN) {
+        constexpr int kWarpsPerBlock = 8;
+        const int units              = width * kKVHeads;
+        const int blocks             = (units + kWarpsPerBlock - 1) / kWarpsPerBlock;
+        if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            volta_flash_append_kv_codec_kernel<kKVHeads, KvK8V4>
+                <<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(k.data),
+                    static_cast<const __nv_bfloat16*>(v.data), position_ptr, rows,
+                    static_cast<KvK8V4::Code*>(cache.k_pages.data),
+                    static_cast<KvK8V4::Code*>(cache.v_pages.data),
+                    static_cast<KvK8V4::KScale*>(cache.k_scale_pages.data),
+                    static_cast<KvK8V4::VScale*>(cache.v_scale_pages.data), block_tables,
+                    logical_pages, width);
+        } else {
+            volta_flash_append_kv_codec_kernel<kKVHeads, KvFp8G64>
+                <<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(k.data),
+                    static_cast<const __nv_bfloat16*>(v.data), position_ptr, rows,
+                    static_cast<KvFp8G64::Code*>(cache.k_pages.data),
+                    static_cast<KvFp8G64::Code*>(cache.v_pages.data),
+                    static_cast<KvFp8G64::KScale*>(cache.k_scale_pages.data),
+                    static_cast<KvFp8G64::VScale*>(cache.v_scale_pages.data), block_tables,
+                    logical_pages, width);
+        }
+    } else if (cache.dtype == DType::U8) {
+        constexpr int kWarpsPerBlock = 8;
+        const int units              = width * kKVHeads;
+        const int blocks             = (units + kWarpsPerBlock - 1) / kWarpsPerBlock;
+        volta_flash_append_kv_codec_kernel<kKVHeads, KvNvfp4G16>
+            <<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
+                position_ptr, rows, static_cast<KvNvfp4G16::Code*>(cache.k_pages.data),
+                static_cast<KvNvfp4G16::Code*>(cache.v_pages.data),
+                static_cast<KvNvfp4G16::KScale*>(cache.k_scale_pages.data),
+                static_cast<KvNvfp4G16::VScale*>(cache.v_scale_pages.data), block_tables,
+                logical_pages, width);
     } else {
         volta_flash_append_kv_kernel<kKVHeads><<<dim3(width, kKVHeads), kHeadDim, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
@@ -555,6 +769,35 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                 static_cast<const std::int8_t*>(cache.v_pages.data),
                 static_cast<const half*>(cache.k_scale_pages.data),
                 static_cast<const half*>(cache.v_scale_pages.data), block_tables, rows,
+                logical_pages, static_cast<half*>(k_gathered.data),
+                static_cast<half*>(v_gathered.data), n_kv_total, n_kv_alloc);
+    } else if (cache.dtype == DType::FP8_E4M3FN) {
+        if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            volta_flash_gather_kv_k8v4_kernel<kKVHeads>
+                <<<dim3(n_kv_alloc, kKVHeads), kHeadDim, 0, stream>>>(
+                    static_cast<const std::uint8_t*>(cache.k_pages.data),
+                    static_cast<const std::uint8_t*>(cache.v_pages.data),
+                    static_cast<const half*>(cache.k_scale_pages.data),
+                    static_cast<const std::uint8_t*>(cache.v_scale_pages.data), block_tables, rows,
+                    logical_pages, static_cast<half*>(k_gathered.data),
+                    static_cast<half*>(v_gathered.data), n_kv_total, n_kv_alloc);
+        } else {
+            volta_flash_gather_kv_fp8_kernel<kKVHeads>
+                <<<dim3(n_kv_alloc, kKVHeads), kHeadDim, 0, stream>>>(
+                    static_cast<const std::uint8_t*>(cache.k_pages.data),
+                    static_cast<const std::uint8_t*>(cache.v_pages.data),
+                    static_cast<const half*>(cache.k_scale_pages.data),
+                    static_cast<const half*>(cache.v_scale_pages.data), block_tables, rows,
+                    logical_pages, static_cast<half*>(k_gathered.data),
+                    static_cast<half*>(v_gathered.data), n_kv_total, n_kv_alloc);
+        }
+    } else if (cache.dtype == DType::U8) {
+        volta_flash_gather_kv_nvfp4_kernel<kKVHeads>
+            <<<dim3(n_kv_alloc, kKVHeads), kHeadDim, 0, stream>>>(
+                static_cast<const std::uint8_t*>(cache.k_pages.data),
+                static_cast<const std::uint8_t*>(cache.v_pages.data),
+                static_cast<const std::uint8_t*>(cache.k_scale_pages.data),
+                static_cast<const std::uint8_t*>(cache.v_scale_pages.data), block_tables, rows,
                 logical_pages, static_cast<half*>(k_gathered.data),
                 static_cast<half*>(v_gathered.data), n_kv_total, n_kv_alloc);
     } else {
@@ -583,7 +826,7 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
             static_cast<int>((q_count + kConvertThreads - 1) / kConvertThreads);
 
         if constexpr (kQHeads == 6) {
-            const bool rotate = cache.dtype == DType::I8;
+            const bool rotate = rotated;
             gqa_attention_volta_splitd_launch(
                 static_cast<const __nv_bfloat16*>(q.data) +
                     static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
@@ -609,7 +852,7 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
             continue;
         }
 
-        if (cache.dtype == DType::I8) {
+        if (rotated) {
             const int rows = tokens * kQHeads;
             volta_flash_convert_q_i8_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data) +
@@ -637,7 +880,7 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                            static_cast<float*>(out_f32.data),
                            static_cast<float2*>(dst_meta.data), tokens, n_kv, n_kv, scale, stream);
 
-        if (cache.dtype == DType::I8) {
+        if (rotated) {
             const int rows = tokens * kQHeads;
             volta_flash_convert_out_i8_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(
                 static_cast<const float*>(out_f32.data),

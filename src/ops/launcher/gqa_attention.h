@@ -37,7 +37,10 @@ inline DType gqa_attention_small_t_accumulator_dtype(
     std::int32_t q_heads, DType cache_dtype, GqaExecutionEnvelope envelope,
     std::int32_t batch_size, std::int32_t tokens) {
 #ifdef NINFER_VOLTA_BUILD
-    if (q_heads == 6 && cache_dtype == DType::I8 && batch_size >= 4 &&
+    // FP8 E4M3 shares the INT8 group-64 geometry and its BF16-mma decode kernel, so the same
+    // FP32-accumulator specialization (nonzero-mean value histories) applies.
+    if (q_heads == 6 && (cache_dtype == DType::I8 || cache_dtype == DType::FP8_E4M3FN) &&
+        batch_size >= 4 &&
         tokens >= 3 && tokens <= 6 && envelope.max_visible_keys > 128 &&
         envelope.max_visible_keys <= 16390) return DType::FP32;
 #endif

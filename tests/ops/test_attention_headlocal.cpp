@@ -122,6 +122,17 @@ HostCache slice_cache_heads(const HostCache& source, int rank) {
             slice_head_major(source.v_bf16, kHeadDim, source.logical_capacity, begin, count);
         return result;
     }
+    if (source.dtype == DType::FP8_E4M3FN) {
+        result.k_fp8 = slice_head_major(source.k_fp8, kHeadDim, source.logical_capacity, begin,
+                                        count);
+        result.v_fp8 = slice_head_major(source.v_fp8, kHeadDim, source.logical_capacity, begin,
+                                        count);
+        result.k_scale =
+            slice_head_major(source.k_scale, kQuantGroups, source.logical_capacity, begin, count);
+        result.v_scale =
+            slice_head_major(source.v_scale, kQuantGroups, source.logical_capacity, begin, count);
+        return result;
+    }
     result.k_i8  = slice_head_major(source.k_i8, kHeadDim, source.logical_capacity, begin, count);
     result.v_i8  = slice_head_major(source.v_i8, kHeadDim, source.logical_capacity, begin, count);
     result.k_scale =
@@ -1236,14 +1247,16 @@ int main(int argc, char** argv) {
         {"gqa_attention_cached", 6, 61, 512, MappingPattern::Identity, 1203u},
         {"gqa_attention_cached", 17, 31, 48, MappingPattern::Identity, 1204u},
     };
-    for (const DType dtype : {DType::BF16, DType::I8}) {
+    for (const DType dtype : {DType::BF16, DType::I8, DType::FP8_E4M3FN}) {
         for (const HeadLocalCase& test_case : cases) { failures += run_case(dtype, test_case); }
         // W in (6,16] with B>1 is the only route into GqaAttentionRoute::ChunkedSmallT for a
         // 12-head geometry; W<=6 with B>1 is SmallT with MultiBatch=true.
+        const std::uint32_t dtype_seed =
+            (dtype == DType::I8) ? 10u : (dtype == DType::FP8_E4M3FN) ? 20u : 0u;
         failures += run_batch_case(dtype, {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity,
-                                           1301u + (dtype == DType::I8 ? 10u : 0u)});
+                                           1301u + dtype_seed});
         failures += run_batch_case(dtype, {1, {63, 511}, {1, 1}, {1, 0}, MappingPattern::Fragmented,
-                                           1311u + (dtype == DType::I8 ? 10u : 0u)});
+                                           1311u + dtype_seed});
         for (const MappingPattern mapping :
              {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
             failures += run_append_case(dtype, mapping, 3, 63, 1401u);

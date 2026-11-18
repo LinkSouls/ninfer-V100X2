@@ -2,6 +2,7 @@
 
 #include "core/layout.h"
 #include "core/tensor.h"
+#include "ninfer/types.h"
 
 #include <cuda_runtime_api.h>
 
@@ -31,6 +32,7 @@ struct PagedKVLayerView {
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    KvCacheStorage storage    = KvCacheStorage::BFloat16; // p4 dispatch key (0.2)
     Tensor read_indices; // Original logical page -> chronological resident-page index.
     Tensor read_table;   // Chronological resident-page index -> physical page.
     std::uint32_t read_capacity = 0;
@@ -53,6 +55,7 @@ struct PagedKVBatchLayerView {
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    KvCacheStorage storage    = KvCacheStorage::BFloat16; // p4 dispatch key (0.2)
     Tensor read_indices;
     Tensor read_tables;
     std::uint32_t read_capacity = 0;
@@ -95,6 +98,30 @@ struct PagedKVPoolLayout {
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
     [[nodiscard]] std::size_t metadata_bytes() const noexcept;
 };
+
+// Per-format KV plane geometry, derived from the KvCacheStorage dispatch key (p4 task 0.2).
+// The layout planner (plan_paged_kv_pool) is format-agnostic: it consumes per-plane dtypes and
+// extents. This struct is the single source of truth mapping a storage format to those, so the
+// format differences (code width, scale semantics, K/V asymmetry) live here, not scattered in the
+// kernels. BF16 has no scale plane (k_scale/v_scale unused, group 0). NVFP4 packs two E2M1 codes
+// per byte, so its code extent is head_dim/2 and its scale is one E4M3 byte per group of 16.
+struct KvCachePlaneGeometry {
+    DType k_code = DType::BF16;
+    DType v_code = DType::BF16;
+    DType k_scale = DType::BF16; // unused when !quantized
+    DType v_scale = DType::BF16;
+    std::int32_t k_group = 0;
+    std::int32_t v_group = 0;
+    // Elements along the head dim per row: code = head_dim / code_bytes, scale = head_dim / group.
+    std::int32_t k_code_extent  = 0;
+    std::int32_t v_code_extent  = 0;
+    std::int32_t k_scale_extent = 0;
+    std::int32_t v_scale_extent = 0;
+    bool quantized = false;
+};
+
+[[nodiscard]] KvCachePlaneGeometry kv_cache_plane_geometry(KvCacheStorage storage,
+                                                           std::int32_t head_dim);
 
 [[nodiscard]] PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder,
                                                    const PagedKVPoolSpec& spec);

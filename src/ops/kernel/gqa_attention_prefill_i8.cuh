@@ -10,6 +10,7 @@
 #include <math_constants.h>
 
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
+#include "ops/kernel/gqa_attention_kv_g64_codec.cuh"
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
 #include "ops/kernel/hadamard_d256.cuh"
 
@@ -80,15 +81,22 @@ __device__ __forceinline__ int4 gqa_prefill_i8_dequant_f16x8(const std::int8_t* 
 
 // Eight independent quantization units per CTA; one warp owns one
 // (token, kv_head, 64-d group), with two dimensions per lane.
-template <typename Geometry, typename Metadata>
+//
+// Codec-generic over the group-64 KV codec policy: KvI8G64 (default, the original P3 INT8 path,
+// bit-identical) and KvFp8G64 (E4M3 code byte, FP16 abs-max scale). Only the code<->value
+// arithmetic and the code byte type change; the D256 rotation, grid, and scale-plane layout are
+// shared. See gqa_attention_kv_g64_codec.cuh.
+template <typename Geometry, typename Metadata, typename KvCodec = KvI8G64>
 __launch_bounds__(256) __global__
     void gqa_attention_prefill_fill_i8_kernel(const __nv_bfloat16* __restrict__ k,
                                               const __nv_bfloat16* __restrict__ v,
                                               const std::int32_t* __restrict__ positions,
-                                              Metadata metadata, std::int8_t* __restrict__ cache_k,
-                                              std::int8_t* __restrict__ cache_v,
-                                              __half* __restrict__ scale_k,
-                                              __half* __restrict__ scale_v, std::int32_t width) {
+                                              Metadata metadata,
+                                              typename KvCodec::Code* __restrict__ cache_k,
+                                              typename KvCodec::Code* __restrict__ cache_v,
+                                              typename KvCodec::KScale* __restrict__ scale_k,
+                                              typename KvCodec::VScale* __restrict__ scale_v,
+                                              std::int32_t width) {
     constexpr int Warps         = 8;
     constexpr unsigned FullMask = 0xffffffffu;
     const int tokens            = metadata.valid_tokens(width);
@@ -120,41 +128,23 @@ __launch_bounds__(256) __global__
     gqa_hadamard_d256_inplace(k_vals, lane);
     gqa_hadamard_d256_inplace(v_vals, lane);
 
-#pragma unroll
-    for (int group = 0; group < kGqaPrefillI8Groups; ++group) {
-        const float k0  = k_vals[2 * group];
-        const float k1  = k_vals[2 * group + 1];
-        const float v0  = v_vals[2 * group];
-        const float v1  = v_vals[2 * group + 1];
-        float k_abs     = warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
-        float v_abs     = warp_max(fmaxf(fabsf(v0), fabsf(v1)), FullMask);
-        const __half ksh  = __float2half_rn(k_abs > 0.0f ? k_abs / 127.0f : 0.0f);
-        const __half vsh  = __float2half_rn(v_abs > 0.0f ? v_abs / 127.0f : 0.0f);
-        const float kinv  = __half2float(ksh) > 0.0f ? 1.0f / __half2float(ksh) : 0.0f;
-        const float vinv  = __half2float(vsh) > 0.0f ? 1.0f / __half2float(vsh) : 0.0f;
-        const std::int64_t code_base =
-            gqa_kv_quant_code_index<Geometry>(page, kv_head, group * kGqaKvQuantGroup, page_off);
-        cache_k[code_base + lane]      = gqa_kv_quant_code(k0, kinv);
-        cache_k[code_base + lane + 32] = gqa_kv_quant_code(k1, kinv);
-        cache_v[code_base + lane]      = gqa_kv_quant_code(v0, vinv);
-        cache_v[code_base + lane + 32] = gqa_kv_quant_code(v1, vinv);
-        if (lane == 0) {
-            const std::int64_t scale_off =
-                gqa_kv_quant_scale_index<Geometry>(page, kv_head, group, page_off);
-            scale_k[scale_off] = ksh;
-            scale_v[scale_off] = vsh;
-        }
-    }
+    // Fused per-format quantize: the policy writes the (rotated) row into this codec's code/scale
+    // planes. For the group-64 INT8/FP8 policies this is the original inline block verbatim;
+    // for NVFP4 it packs 2 E2M1/byte + a group-16 E4M3 scale byte.
+    KvCodec::template quantize_row<Geometry>(k_vals, v_vals, page, kv_head, page_off, cache_k, cache_v,
+                                    scale_k, scale_v);
 }
 
 // Large appends are scheduled in absolute eight-token tiles. Eight divides P=64, so each CTA is
 // page-local while an unknown base offset costs at most one empty tail CTA in the launch envelope.
-template <typename Geometry, typename Metadata>
+// Codec-generic over KvI8G64 (default) / KvFp8G64 -- see the non-page fill kernel above.
+template <typename Geometry, typename Metadata, typename KvCodec = KvI8G64>
 __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, Metadata metadata,
-    std::int8_t* __restrict__ cache_k, std::int8_t* __restrict__ cache_v,
-    __half* __restrict__ scale_k, __half* __restrict__ scale_v, std::int32_t width) {
+    typename KvCodec::Code* __restrict__ cache_k, typename KvCodec::Code* __restrict__ cache_v,
+    typename KvCodec::KScale* __restrict__ scale_k, typename KvCodec::VScale* __restrict__ scale_v,
+    std::int32_t width) {
     constexpr int TokensPerTile = 8;
     constexpr unsigned FullMask = 0xffffffffu;
     const int tokens            = metadata.valid_tokens(width);
@@ -193,35 +183,10 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
 
     const int position = base_position + token;
     const int page_off = position & kPagedKVPageMask;
-    const std::int64_t code_base =
-        paged_kv_page_head_offset<kGqaKvQuantHeadDim, Geometry::KVHeads>(physical_page, kv_head) +
-        static_cast<std::int64_t>(page_off) * kGqaKvQuantHeadDim;
-#pragma unroll
-    for (int group = 0; group < kGqaPrefillI8Groups; ++group) {
-        const float k0  = k_vals[2 * group];
-        const float k1  = k_vals[2 * group + 1];
-        const float v0  = v_vals[2 * group];
-        const float v1  = v_vals[2 * group + 1];
-        float k_abs     = warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
-        float v_abs     = warp_max(fmaxf(fabsf(v0), fabsf(v1)), FullMask);
-        const __half ksh  = __float2half_rn(k_abs > 0.0f ? k_abs / 127.0f : 0.0f);
-        const __half vsh  = __float2half_rn(v_abs > 0.0f ? v_abs / 127.0f : 0.0f);
-        const float kinv  = __half2float(ksh) > 0.0f ? 1.0f / __half2float(ksh) : 0.0f;
-        const float vinv  = __half2float(vsh) > 0.0f ? 1.0f / __half2float(vsh) : 0.0f;
-        const std::int64_t gcode = code_base + group * kGqaKvQuantGroup;
-        cache_k[gcode + lane]      = gqa_kv_quant_code(k0, kinv);
-        cache_k[gcode + lane + 32] = gqa_kv_quant_code(k1, kinv);
-        cache_v[gcode + lane]      = gqa_kv_quant_code(v0, vinv);
-        cache_v[gcode + lane + 32] = gqa_kv_quant_code(v1, vinv);
-        if (lane == 0) {
-            const std::int64_t scale_offset =
-                paged_kv_page_head_offset<kGqaKvQuantGroups, Geometry::KVHeads>(physical_page,
-                                                                                kv_head) +
-                static_cast<std::int64_t>(page_off) * kGqaKvQuantGroups + group;
-            scale_k[scale_offset] = ksh;
-            scale_v[scale_offset] = vsh;
-        }
-    }
+    // Fused per-format quantize (group-64 INT8/FP8 verbatim; NVFP4 packs 2 E2M1/byte).
+    KvCodec::template quantize_row<Geometry>(k_vals, v_vals, physical_page, kv_head, page_off,
+                                    cache_k,
+                                    cache_v, scale_k, scale_v);
 }
 
 template <typename Geometry, typename Metadata>

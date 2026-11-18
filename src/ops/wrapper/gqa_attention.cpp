@@ -16,6 +16,11 @@ namespace {
 
 constexpr std::int32_t kHeadDim                      = 256;
 constexpr std::int32_t kQuantGroup                   = 64;
+// NVFP4 (E2M1) group-16 geometry: two E2M1 codes packed per byte (code extent head_dim/2) and one
+// E4M3 scale byte per 16-dim group (scale extent head_dim/16, FP8_E4M3FN). Structurally distinct
+// from the g64 INT8/FP8 path (byte code + FP16 scale per 64), so validate_cache special-cases it.
+constexpr std::int32_t kNvfp4Group                   = 16;
+constexpr std::int32_t kNvfp4Groups                  = kHeadDim / kNvfp4Group;
 constexpr float kExpectedScale                       = 0.0625f;
 // 6 is the worst value in its neighbourhood on the Volta tensor-core prefill path. That kernel
 // packs Br=32 rows per row-tile pass, and rows = TokenTile * GQA group size (6 for this model's
@@ -65,15 +70,22 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 }
 
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8 &&
+         cache.dtype != DType::FP8_E4M3FN && cache.dtype != DType::U8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
     if (cache.dtype == DType::BF16 && cache.quant_group != 0) {
         throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have quant_group");
     }
-    if (cache.dtype == DType::I8 && cache.quant_group != kQuantGroup) {
-        throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
+    if ((cache.dtype == DType::I8 || cache.dtype == DType::FP8_E4M3FN) &&
+        cache.quant_group != kQuantGroup) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": quantized (I8/FP8) KV cache must use quant_group 64");
+    }
+    if (cache.dtype == DType::U8 && cache.quant_group != kNvfp4Group) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": NVFP4 KV cache must use quant_group 16");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -84,13 +96,32 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
-    if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
+    const DType code_dtype =
+        cache.dtype == DType::I8          ? DType::I8
+        : cache.dtype == DType::FP8_E4M3FN ? DType::FP8_E4M3FN
+        : cache.dtype == DType::U8         ? DType::U8
+                                           : DType::BF16;
+    // K8V4 is asymmetric: the key plane carries FP8 E4M3 group-64 codes (256 bytes/row) and the
+    // value plane carries NVFP4 packed-E2M1 group-16 codes (128 bytes/row); the per-plane dtypes
+    // and extents below mirror kv_cache_plane_geometry(Fp8KeyNvfp4Value), the single source of
+    // truth. The symmetric formats keep one code dtype for both planes.
+    const bool k8v4 = cache.dtype == DType::FP8_E4M3FN &&
+                      cache.storage == KvCacheStorage::Fp8KeyNvfp4Value;
+    const DType k_code_dtype = k8v4 ? DType::FP8_E4M3FN : code_dtype;
+    const DType v_code_dtype = k8v4 ? DType::U8 : code_dtype;
+    if (cache.k_pages.dtype != k_code_dtype || cache.v_pages.dtype != v_code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    const std::int32_t v_code_extent =
+        (k8v4 || cache.dtype == DType::U8) ? kHeadDim / 2 : kHeadDim;
+    // Symmetric NVFP4 packs two E2M1 codes per byte on BOTH planes (extent head_dim/2); K8V4's key
+    // plane is the full-width FP8 code (extent head_dim); the other formats are full-width. This
+    // mirrors kv_cache_plane_geometry, the single source of truth.
+    const std::int32_t k_code_extent =
+        (cache.dtype == DType::U8 && !k8v4) ? kHeadDim / 2 : kHeadDim;
+    require_shape(cache.k_pages, k_code_extent, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, v_code_extent, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
@@ -107,14 +138,24 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         return static_cast<std::uint32_t>(capacity);
     }
 
+    // K8V4 key scales are FP16 (4 groups of 64); its value scales are E4M3 bytes (16 groups of
+    // 16). Symmetric NVFP4 uses E4M3 bytes on both planes; INT8/FP8 use FP16 on both.
     constexpr std::int32_t groups = kHeadDim / kQuantGroup;
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
+    const DType k_scale_dtype =
+        k8v4 ? DType::FP16 : (cache.dtype == DType::U8 ? DType::FP8_E4M3FN : DType::FP16);
+    const DType v_scale_dtype =
+        (k8v4 || cache.dtype == DType::U8) ? DType::FP8_E4M3FN : DType::FP16;
+    const std::int32_t k_scale_groups =
+        k8v4 ? groups : (cache.dtype == DType::U8 ? kNvfp4Groups : groups);
+    const std::int32_t v_scale_groups =
+        (k8v4 || cache.dtype == DType::U8) ? kNvfp4Groups : groups;
+    if (cache.k_scale_pages.dtype != k_scale_dtype || cache.v_scale_pages.dtype != v_scale_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
-    require_shape(cache.k_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache k scale pages");
-    require_shape(cache.v_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache v scale pages");
+    require_shape(cache.k_scale_pages, k_scale_groups, kPagedKVPageSize, kv_heads, physical_pages,
+                  op, "cache k scale pages");
+    require_shape(cache.v_scale_pages, v_scale_groups, kPagedKVPageSize, kv_heads, physical_pages,
+                  op, "cache v scale pages");
     require_contiguous_nonnull(cache.k_scale_pages, op, "cache k scale pages");
     require_contiguous_nonnull(cache.v_scale_pages, op, "cache v scale pages");
     return static_cast<std::uint32_t>(capacity);
@@ -122,15 +163,22 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
 
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8 &&
+         cache.dtype != DType::FP8_E4M3FN && cache.dtype != DType::U8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
     if (cache.dtype == DType::BF16 && cache.quant_group != 0) {
         throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have quant_group");
     }
-    if (cache.dtype == DType::I8 && cache.quant_group != kQuantGroup) {
-        throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
+    if ((cache.dtype == DType::I8 || cache.dtype == DType::FP8_E4M3FN) &&
+        cache.quant_group != kQuantGroup) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": quantized (I8/FP8) KV cache must use quant_group 64");
+    }
+    if (cache.dtype == DType::U8 && cache.quant_group != kNvfp4Group) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": NVFP4 KV cache must use quant_group 16");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -142,13 +190,28 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
-    if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
+    const DType code_dtype =
+        cache.dtype == DType::I8          ? DType::I8
+        : cache.dtype == DType::FP8_E4M3FN ? DType::FP8_E4M3FN
+        : cache.dtype == DType::U8         ? DType::U8
+                                           : DType::BF16;
+    const bool k8v4 = cache.dtype == DType::FP8_E4M3FN &&
+                      cache.storage == KvCacheStorage::Fp8KeyNvfp4Value;
+    const DType k_code_dtype = k8v4 ? DType::FP8_E4M3FN : code_dtype;
+    const DType v_code_dtype = k8v4 ? DType::U8 : code_dtype;
+    if (cache.k_pages.dtype != k_code_dtype || cache.v_pages.dtype != v_code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    const std::int32_t v_code_extent =
+        (k8v4 || cache.dtype == DType::U8) ? kHeadDim / 2 : kHeadDim;
+    // Symmetric NVFP4 packs two E2M1 codes per byte on BOTH planes (extent head_dim/2); K8V4's key
+    // plane is the full-width FP8 code (extent head_dim); the other formats are full-width. This
+    // mirrors kv_cache_plane_geometry, the single source of truth.
+    const std::int32_t k_code_extent =
+        (cache.dtype == DType::U8 && !k8v4) ? kHeadDim / 2 : kHeadDim;
+    require_shape(cache.k_pages, k_code_extent, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, v_code_extent, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
@@ -166,13 +229,21 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     }
 
     constexpr std::int32_t groups = kHeadDim / kQuantGroup;
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
+    const DType k_scale_dtype =
+        k8v4 ? DType::FP16 : (cache.dtype == DType::U8 ? DType::FP8_E4M3FN : DType::FP16);
+    const DType v_scale_dtype =
+        (k8v4 || cache.dtype == DType::U8) ? DType::FP8_E4M3FN : DType::FP16;
+    const std::int32_t k_scale_groups =
+        k8v4 ? groups : (cache.dtype == DType::U8 ? kNvfp4Groups : groups);
+    const std::int32_t v_scale_groups =
+        (k8v4 || cache.dtype == DType::U8) ? kNvfp4Groups : groups;
+    if (cache.k_scale_pages.dtype != k_scale_dtype || cache.v_scale_pages.dtype != v_scale_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
-    require_shape(cache.k_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache k scale pages");
-    require_shape(cache.v_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache v scale pages");
+    require_shape(cache.k_scale_pages, k_scale_groups, kPagedKVPageSize, kv_heads, physical_pages,
+                  op, "cache k scale pages");
+    require_shape(cache.v_scale_pages, v_scale_groups, kPagedKVPageSize, kv_heads, physical_pages,
+                  op, "cache v scale pages");
     require_contiguous_nonnull(cache.k_scale_pages, op, "cache k scale pages");
     require_contiguous_nonnull(cache.v_scale_pages, op, "cache v scale pages");
     return static_cast<std::uint32_t>(capacity);
@@ -293,8 +364,24 @@ SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_
 // {visible, visible}: testing min == max in the capacity probe would report zero
 // bytes for a route that then allocates hundreds of megabytes at runtime. The
 // capacity probe therefore uses only the envelope's bound, never its shape.
+// Code-dtype -> storage map used by the routing/capacity entry points, which take a code DType.
+// The symmetric formats are recoverable from their code dtype losslessly. The asymmetric
+// Fp8KeyNvfp4Value has no single code dtype (key FP8 / value E2M1) and reports FP8_E4M3FN here,
+// which maps to Fp8E4M3Group64; that value is in the same accepted set as Fp8KeyNvfp4Value, so
+// the boolean "use the flash route?" decision is still correct, and the actual per-format kernel
+// dispatch happens downstream in the flash launcher, which keys on the view's real KvCacheStorage
+// (PagedKVBatchLayerView::storage). The public entry points therefore keep their DType signature.
+KvCacheStorage kv_storage_for_code_dtype(DType code) {
+    switch (code) {
+    case DType::I8:         return KvCacheStorage::Int8Group64;
+    case DType::FP8_E4M3FN: return KvCacheStorage::Fp8E4M3Group64;
+    case DType::U8:         return KvCacheStorage::Nvfp4Group16;
+    default:                return KvCacheStorage::BFloat16;
+    }
+}
+
 bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
-                                std::int32_t batch_size, DType cache_dtype) {
+                                std::int32_t batch_size, KvCacheStorage storage) {
     // 24q/4kv and the 12q/2kv TP2 half share ratio 6 -> ncols2 2. 16q/2kv is also
     // instantiated (ratio 8 -> ncols2 8), but it corrupts shared memory: the combine buffer is
     // sized on the host from get_cols_per_warp(), which is 32 on Volta, while the kernel indexes
@@ -309,8 +396,17 @@ bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
     // INT8 cache stays self-consistent on this route (every writer and reader uses the
     // rotated coordinates, including chunks appended by the chunked/decode routes).
     // BF16 is unaffected (no rotation) and keeps its original elementwise kernels.
+    // p4 fp8/nvfp4/k8v4: these formats share the rotated-coordinate contract and the same
+    // three-segment flash structure -- a rotate + codec append kernel (the per-format
+    // quantize is delegated to the codec policy, so the code/scale layout matches each format's
+    // layout plan), a code-decode gather, the format-independent Q-row-rotation staging, and the
+    // one-time inverse-rotation epilogue. All three are served by the flash route now that their
+    // branches land in gqa_attention_volta_flash.cu; the BF16 and INT8 branches stay
+    // bit-identical.
     return (q_heads == 24 || q_heads == 12 || q_heads == 6) && batch_size == 1 &&
-           (cache_dtype == DType::BF16 || cache_dtype == DType::I8) &&
+           (storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Int8Group64 ||
+            storage == KvCacheStorage::Fp8E4M3Group64 || storage == KvCacheStorage::Nvfp4Group16 ||
+            storage == KvCacheStorage::Fp8KeyNvfp4Value) &&
            width >= detail::kVoltaFlashMinimumWidth;
 }
 
@@ -430,7 +526,7 @@ GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t
     //  - the envelope must cover the width, or `base` below would go negative.
     //  - the gather stages BF16 cache rows into FP16, or dequantizes INT8-G64
     //    cache rows into the same FP16 boundary once per layer.
-    if (volta_flash_route_possible(q_heads, width, batch_size, cache_dtype) &&
+    if (volta_flash_route_possible(q_heads, width, batch_size, kv_storage_for_code_dtype(cache_dtype)) &&
         envelope.min_visible_keys == envelope.max_visible_keys &&
         envelope.max_visible_keys >= static_cast<std::uint32_t>(width)) {
         return GqaAttentionRoute::VoltaFlash;
@@ -481,7 +577,9 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width, bool resident_read) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
-    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || batch_size <= 0 ||
+    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
+         cache_dtype != DType::FP8_E4M3FN && cache_dtype != DType::U8) ||
+        batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
@@ -542,7 +640,8 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     // The staging grows monotonically with width (only through
     // min(width, kVoltaFlashQBlockTokens)), so the widest width in the interval
     // bounds every narrower one that also routes here.
-    if (volta_flash_route_possible(q_heads, max_width, batch_size, cache_dtype)) {
+    if (volta_flash_route_possible(q_heads, max_width, batch_size,
+                                   kv_storage_for_code_dtype(cache_dtype))) {
         WorkspaceLayoutBuilder layout;
         (void)allocate_volta_flash_workspace(layout, q_heads, max_width, envelope);
         maximum = std::max(maximum, layout.peak_bytes(1));

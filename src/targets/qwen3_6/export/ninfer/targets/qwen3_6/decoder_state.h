@@ -20,6 +20,7 @@ struct DecoderStateSpec {
     std::int32_t attention_head_dim         = 0;
     DType kv_dtype                          = DType::BF16;
     std::int32_t kv_quant_group             = 0;
+    KvCacheStorage kv_storage               = KvCacheStorage::BFloat16; // p4 dispatch key (0.2)
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
@@ -36,6 +37,7 @@ struct PagedKVCacheLayout {
     std::int32_t head_dim     = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    KvCacheStorage storage    = KvCacheStorage::BFloat16; // p4 dispatch key (0.2)
     TensorRegion retrieval_keys;
     TensorRegion retrieval_query;
     TensorRegion retrieval_fallback;
@@ -105,6 +107,7 @@ private:
     std::int32_t head_dim_     = 0;
     DType dtype_               = DType::BF16;
     std::int32_t quant_group_  = 0;
+    KvCacheStorage storage_    = KvCacheStorage::BFloat16; // p4 dispatch key (0.2)
 };
 
 struct DecoderStateLayout {

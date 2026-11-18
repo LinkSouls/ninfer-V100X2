@@ -129,10 +129,10 @@ std::vector<double> long_reference(const std::vector<float>& q, const HostCache&
     std::vector<double> scores(static_cast<std::size_t>(visible));
     std::vector<double> output(heads.size() * static_cast<std::size_t>(kHeadDim));
 
-    // p3 kv-cache-rotation: the INT8 cache lives in the D256 rotated coordinates, so the oracle
+    // p3/p4: the quantized cache (INT8 and FP8) lives in the D256 rotated coordinates, so the oracle
     // must mirror the fixture's ideal_attention: score in rotated space ((Hq)·(Hk) == q·k) and
     // undo the V rotation on the output row (the transform is an involution).
-    const bool rotated = cache.dtype == DType::I8;
+    const bool rotated = (cache.dtype == DType::I8 || cache.dtype == DType::FP8_E4M3FN);
     for (std::size_t slot = 0; slot < heads.size(); ++slot) {
         const std::int32_t q_head  = heads[slot];
         const std::int32_t kv_head = q_head / geometry.query_group();
@@ -343,6 +343,9 @@ int main() {
         // the 1M deployment uses; the pages are ~2.2 GiB plus 67 MiB of scales, and the case skips
         // itself if the device cannot hold them.
         {{"qwen3_6_27b", 24, 4}, 85, DType::I8, {1048574, 1048575}, 904u},
+        // p4 fp8-e4m3: FP8 decode at a long window (same tensor-core split-KV path as INT8). The
+        // case self-skips if the device cannot hold the ~2.2 GiB pool plus scales.
+        {{"qwen3_6_27b", 24, 4}, 85, DType::FP8_E4M3FN, {400000}, 905u},
     };
 
     int failures = 0;

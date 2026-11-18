@@ -5,10 +5,13 @@
 #include "ops/kernel/gqa_attention_decode_i8_qpn_verify_volta.cuh"
 #include "ops/kernel/gqa_attention_decode_i8_qpn_verify5_volta.cuh"
 #include "ops/kernel/gqa_attention_decode_i8_qpn_volta.cuh"
+#include "ops/kernel/gqa_attention_nvfp4_g16_codec.cuh"
+#include "ops/kernel/gqa_attention_k8v4_codec.cuh"
 #include "ops/launcher/kernel_attr_once.h"
 
 namespace ninfer::ops::detail {
 
+template <typename KvCodec>
 void gqa_attention_single_qpn_volta_launch(
     const Tensor& q, const __nv_bfloat16* new_k, const __nv_bfloat16* new_v,
     const Tensor& positions, float scale, PagedKVBatchLayerView cache,
@@ -17,14 +20,14 @@ void gqa_attention_single_qpn_volta_launch(
     Tensor& partial_l, cudaStream_t stream) {
     const auto launch = [&]<typename Geometry, bool MultiBatch, bool Masked, typename CacheInput>(CacheInput input) {
         const auto profile = [&]<bool LongProfile>() {
-            gqa_attention_single_qpn_volta_partial_i8_kernel<Geometry, MultiBatch, Masked, CacheInput, LongProfile>
+            gqa_attention_single_qpn_volta_partial_i8_kernel<Geometry, MultiBatch, Masked, CacheInput, LongProfile, KvCodec>
                 <<<dim3(Geometry::KVHeads, splits, invocation.batch_size), 256, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data), input,
                     static_cast<const std::int32_t*>(positions.data),
-                    static_cast<std::int8_t*>(cache.k_pages.data),
-                    static_cast<std::int8_t*>(cache.v_pages.data),
-                    static_cast<half*>(cache.k_scale_pages.data),
-                    static_cast<half*>(cache.v_scale_pages.data),
+                    static_cast<KvCodec::Code*>(cache.k_pages.data),
+                    static_cast<KvCodec::Code*>(cache.v_pages.data),
+                    static_cast<KvCodec::KScale*>(cache.k_scale_pages.data),
+                    static_cast<KvCodec::VScale*>(cache.v_scale_pages.data),
                     static_cast<const std::int32_t*>(cache.block_tables.data),
                     invocation.valid_columns == nullptr ? nullptr
                         : static_cast<const std::int32_t*>(invocation.valid_columns->data),
@@ -62,6 +65,7 @@ void gqa_attention_single_qpn_volta_launch(
     else { dispatch(GqaCachedInput{}); }
 }
 
+template <typename KvCodec>
 void gqa_attention_verify_qpn_volta_launch(
     const Tensor& q, const __nv_bfloat16* new_k, const __nv_bfloat16* new_v,
     const Tensor& positions, float scale, PagedKVBatchLayerView cache,
@@ -78,10 +82,10 @@ void gqa_attention_verify_qpn_volta_launch(
                        256, dynamic_bytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
                 static_cast<const std::int32_t*>(positions.data),
-                static_cast<std::int8_t*>(cache.k_pages.data),
-                static_cast<std::int8_t*>(cache.v_pages.data),
-                static_cast<half*>(cache.k_scale_pages.data),
-                static_cast<half*>(cache.v_scale_pages.data),
+                static_cast<KvCodec::Code*>(cache.k_pages.data),
+                static_cast<KvCodec::Code*>(cache.v_pages.data),
+                static_cast<KvCodec::KScale*>(cache.k_scale_pages.data),
+                static_cast<KvCodec::VScale*>(cache.v_scale_pages.data),
                 static_cast<const std::int32_t*>(cache.block_tables.data),
                 invocation.valid_columns == nullptr ? nullptr
                     : static_cast<const std::int32_t*>(invocation.valid_columns->data),
@@ -92,9 +96,9 @@ void gqa_attention_verify_qpn_volta_launch(
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
         };
         if (invocation.width == 5) {
-            issue(gqa_attention_verify5_qpn_volta_partial_i8_kernel<Geometry, MultiBatch, Masked, CacheInput>, 0);
+            issue(gqa_attention_verify5_qpn_volta_partial_i8_kernel<Geometry, MultiBatch, Masked, CacheInput, KvCodec>, 0);
         } else {
-            issue(gqa_attention_verify_qpn_volta_partial_i8_kernel<Geometry, MultiBatch, Masked, CacheInput>,
+            issue(gqa_attention_verify_qpn_volta_partial_i8_kernel<Geometry, MultiBatch, Masked, CacheInput, KvCodec>,
                   kGqaVerifyQpnDynamicBytes);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -125,6 +129,43 @@ void gqa_attention_verify_qpn_volta_launch(
         dispatch(GqaCachedInput{});
     }
 }
+
+// The QPN long-context launchers are codec-generic and are called from a DIFFERENT translation
+// unit (gqa_attention_decode.cu's small-T path), so their concrete specializations must be emitted
+// here explicitly. INT8 and FP8 share the same kernel body, differing only in the group-64 codec
+// (int8 codes vs E4M3 codes with an FP16 abs-max scale); NVFP4 uses the group-16 E2M1/E4M3 codec.
+template void gqa_attention_single_qpn_volta_launch<KvI8G64>(
+    const Tensor&, const __nv_bfloat16*, const __nv_bfloat16*, const Tensor&, float,
+    PagedKVBatchLayerView, const GqaSmallTInvocation&, std::int32_t, bool, std::int32_t,
+    Tensor&, Tensor&, Tensor&, cudaStream_t);
+template void gqa_attention_single_qpn_volta_launch<KvFp8G64>(
+    const Tensor&, const __nv_bfloat16*, const __nv_bfloat16*, const Tensor&, float,
+    PagedKVBatchLayerView, const GqaSmallTInvocation&, std::int32_t, bool, std::int32_t,
+    Tensor&, Tensor&, Tensor&, cudaStream_t);
+template void gqa_attention_single_qpn_volta_launch<KvNvfp4G16>(
+    const Tensor&, const __nv_bfloat16*, const __nv_bfloat16*, const Tensor&, float,
+    PagedKVBatchLayerView, const GqaSmallTInvocation&, std::int32_t, bool, std::int32_t,
+    Tensor&, Tensor&, Tensor&, cudaStream_t);
+template void gqa_attention_single_qpn_volta_launch<KvK8V4>(
+    const Tensor&, const __nv_bfloat16*, const __nv_bfloat16*, const Tensor&, float,
+    PagedKVBatchLayerView, const GqaSmallTInvocation&, std::int32_t, bool, std::int32_t,
+    Tensor&, Tensor&, Tensor&, cudaStream_t);
+template void gqa_attention_verify_qpn_volta_launch<KvI8G64>(
+    const Tensor&, const __nv_bfloat16*, const __nv_bfloat16*, const Tensor&, float,
+    PagedKVBatchLayerView, const GqaSmallTInvocation&, std::int32_t, std::int32_t,
+    Tensor&, Tensor&, Tensor&, cudaStream_t);
+template void gqa_attention_verify_qpn_volta_launch<KvFp8G64>(
+    const Tensor&, const __nv_bfloat16*, const __nv_bfloat16*, const Tensor&, float,
+    PagedKVBatchLayerView, const GqaSmallTInvocation&, std::int32_t, std::int32_t,
+    Tensor&, Tensor&, Tensor&, cudaStream_t);
+template void gqa_attention_verify_qpn_volta_launch<KvNvfp4G16>(
+    const Tensor&, const __nv_bfloat16*, const __nv_bfloat16*, const Tensor&, float,
+    PagedKVBatchLayerView, const GqaSmallTInvocation&, std::int32_t, std::int32_t,
+    Tensor&, Tensor&, Tensor&, cudaStream_t);
+template void gqa_attention_verify_qpn_volta_launch<KvK8V4>(
+    const Tensor&, const __nv_bfloat16*, const __nv_bfloat16*, const Tensor&, float,
+    PagedKVBatchLayerView, const GqaSmallTInvocation&, std::int32_t, std::int32_t,
+    Tensor&, Tensor&, Tensor&, cudaStream_t);
 
 } // namespace ninfer::ops::detail
 #endif

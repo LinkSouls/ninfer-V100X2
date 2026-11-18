@@ -184,6 +184,142 @@ int check_host_snapshot(ninfer::PagedKVPlaneOrder order, cudaStream_t stream) {
     return 0;
 }
 
+// p4 task 2.3: NVFP4 group-16 code/scale plane geometry, driven by the single source of truth
+// kv_cache_plane_geometry and built exactly the way decoder_state.cpp::plan_cache does for a
+// quantized format (K/V code planes + K/V scale planes). Verifies the code plane width
+// (two E2M1 codes per byte -> head_dim/2 U8), the group-16 scale plane (one E4M3 byte per 16 ->
+// head_dim/16 FP8_E4M3FN), and that the code and scale planes occupy disjoint regions.
+int check_nvfp4_planes() {
+    constexpr std::int32_t head_dim = 256;
+    constexpr std::int32_t kv_heads = 4;
+    constexpr std::uint32_t phys    = 10;
+
+    const auto g = ninfer::kv_cache_plane_geometry(ninfer::KvCacheStorage::Nvfp4Group16, head_dim);
+    if (g.k_code != ninfer::DType::U8 || g.v_code != ninfer::DType::U8) {
+        return fail("NVFP4 code plane dtype is not U8");
+    }
+    if (g.k_scale != ninfer::DType::FP8_E4M3FN || g.v_scale != ninfer::DType::FP8_E4M3FN) {
+        return fail("NVFP4 scale plane dtype is not FP8_E4M3FN");
+    }
+    if (g.k_group != 16 || g.v_group != 16) { return fail("NVFP4 group is not 16"); }
+    if (g.k_code_extent != head_dim / 2 || g.v_code_extent != head_dim / 2) {
+        return fail("NVFP4 code extent is not head_dim/2");
+    }
+    if (g.k_scale_extent != head_dim / 16 || g.v_scale_extent != head_dim / 16) {
+        return fail("NVFP4 scale extent is not head_dim/16");
+    }
+    if (!g.quantized) { return fail("NVFP4 is not marked quantized"); }
+
+    std::vector<ninfer::PagedKVPlaneSpec> planes;
+    planes.push_back({g.k_code,  g.k_code_extent,  kv_heads, 256});
+    planes.push_back({g.v_code,  g.v_code_extent,  kv_heads, 256});
+    planes.push_back({g.k_scale, g.k_scale_extent, kv_heads, 256});
+    planes.push_back({g.v_scale, g.v_scale_extent, kv_heads, 256});
+
+    auto plan = plan_paged_cache(phys, phys, 1, std::move(planes));
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
+
+    int failures = 0;
+    failures += check_shape(pool.plane(0), {head_dim / 2, 64, kv_heads, phys}, "NVFP4 K code plane");
+    failures += check_shape(pool.plane(1), {head_dim / 2, 64, kv_heads, phys}, "NVFP4 V code plane");
+    failures +=
+        check_shape(pool.plane(2), {head_dim / 16, 64, kv_heads, phys}, "NVFP4 K scale plane");
+    failures +=
+        check_shape(pool.plane(3), {head_dim / 16, 64, kv_heads, phys}, "NVFP4 V scale plane");
+
+    const std::size_t code_bytes  = static_cast<std::size_t>(head_dim / 2) * 64 * kv_heads * phys;
+    const std::size_t scale_bytes = static_cast<std::size_t>(head_dim / 16) * 64 * kv_heads * phys;
+    failures +=
+        expect_size(plan.layout.payload_bytes(), 2 * code_bytes + 2 * scale_bytes,
+                    "NVFP4 payload bytes");
+
+    // Every code/scale plane must be a disjoint region of the pool (no code/scale overlap).
+    for (std::size_t i = 0; i < pool.plane_count(); ++i) {
+        const auto& a = plan.layout.planes[i].storage.region;
+        for (std::size_t j = i + 1; j < pool.plane_count(); ++j) {
+            const auto& b = plan.layout.planes[j].storage.region;
+            const bool disjoint = a.offset + a.bytes <= b.offset ||
+                                  b.offset + b.bytes <= a.offset;
+            if (!disjoint) {
+                ++failures;
+                std::cerr << "NVFP4 plane " << i << " overlaps plane " << j << '\n';
+            }
+        }
+    }
+    return failures;
+}
+
+// p4 k8v4: the asymmetric Fp8KeyNvfp4Value layout — key plane in FP8 E4M3 group-64 geometry
+// (1-byte code × head_dim + FP16 scale × head_dim/64), value plane in NVFP4 group-16 geometry
+// (packed E2M1 U8 × head_dim/2 + E4M3 scale × head_dim/16). The two planes are independent:
+// each carries its own dtype/extent from kv_cache_plane_geometry, the planner lays them out
+// as disjoint regions, and nothing mixes the K and V geometries.
+int check_k8v4_planes() {
+    constexpr std::int32_t head_dim = 256;
+    constexpr std::int32_t kv_heads = 4;
+    constexpr std::uint32_t phys    = 10;
+
+    const auto g = ninfer::kv_cache_plane_geometry(ninfer::KvCacheStorage::Fp8KeyNvfp4Value, head_dim);
+    if (g.k_code != ninfer::DType::FP8_E4M3FN) {
+        return fail("K8V4 key code plane dtype is not FP8_E4M3FN");
+    }
+    if (g.v_code != ninfer::DType::U8) { return fail("K8V4 value code plane dtype is not U8"); }
+    if (g.k_scale != ninfer::DType::FP16 || g.v_scale != ninfer::DType::FP8_E4M3FN) {
+        return fail("K8V4 scale plane dtypes are not FP16 (key) / FP8_E4M3FN (value)");
+    }
+    if (g.k_group != 64 || g.v_group != 16) {
+        return fail("K8V4 groups are not 64 (key) / 16 (value)");
+    }
+    if (g.k_code_extent != head_dim || g.v_code_extent != head_dim / 2) {
+        return fail("K8V4 code extents are not head_dim (key) / head_dim/2 (value)");
+    }
+    if (g.k_scale_extent != head_dim / 64 || g.v_scale_extent != head_dim / 16) {
+        return fail("K8V4 scale extents are not head_dim/64 (key) / head_dim/16 (value)");
+    }
+    if (!g.quantized) { return fail("K8V4 is not marked quantized"); }
+
+    std::vector<ninfer::PagedKVPlaneSpec> planes;
+    planes.push_back({g.k_code,  g.k_code_extent,  kv_heads, 256});
+    planes.push_back({g.v_code,  g.v_code_extent,  kv_heads, 256});
+    planes.push_back({g.k_scale, g.k_scale_extent, kv_heads, 256});
+    planes.push_back({g.v_scale, g.v_scale_extent, kv_heads, 256});
+
+    auto plan = plan_paged_cache(phys, phys, 1, std::move(planes));
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
+
+    int failures = 0;
+    failures += check_shape(pool.plane(0), {head_dim, 64, kv_heads, phys}, "K8V4 K code plane");
+    failures += check_shape(pool.plane(1), {head_dim / 2, 64, kv_heads, phys}, "K8V4 V code plane");
+    failures +=
+        check_shape(pool.plane(2), {head_dim / 64, 64, kv_heads, phys}, "K8V4 K scale plane");
+    failures +=
+        check_shape(pool.plane(3), {head_dim / 16, 64, kv_heads, phys}, "K8V4 V scale plane");
+
+    // Per (kv_head, page, physical page): K = 256*1 + 4*2, V = 128*1 + 16*1.
+    const std::size_t k_bytes =
+        (static_cast<std::size_t>(head_dim) + 2u * (head_dim / 64)) * 64 * kv_heads * phys;
+    const std::size_t v_bytes =
+        (static_cast<std::size_t>(head_dim / 2) + head_dim / 16) * 64 * kv_heads * phys;
+    failures += expect_size(plan.layout.payload_bytes(), k_bytes + v_bytes, "K8V4 payload bytes");
+
+    // Every key/value plane must be a disjoint region of the pool (no K/V or code/scale overlap).
+    for (std::size_t i = 0; i < pool.plane_count(); ++i) {
+        const auto& a = plan.layout.planes[i].storage.region;
+        for (std::size_t j = i + 1; j < pool.plane_count(); ++j) {
+            const auto& b = plan.layout.planes[j].storage.region;
+            const bool disjoint = a.offset + a.bytes <= b.offset ||
+                                  b.offset + b.bytes <= a.offset;
+            if (!disjoint) {
+                ++failures;
+                std::cerr << "K8V4 plane " << i << " overlaps plane " << j << '\n';
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -202,6 +338,8 @@ int main() {
     ninfer::DeviceContext ctx(0);
     failures += check_host_snapshot(ninfer::PagedKVPlaneOrder::PageMajor, ctx.stream);
     failures += check_host_snapshot(ninfer::PagedKVPlaneOrder::HeadMajor, ctx.stream);
+    failures += check_nvfp4_planes();
+    failures += check_k8v4_planes();
 
     auto paged_plan = plan_paged_cache(10, 10, 2,
                                        {{ninfer::DType::I8, 64, 2},

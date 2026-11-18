@@ -279,6 +279,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
       draft_window(plan.draft_window), ram_kv(plan.ram_kv), volta_long_attention(plan.volta_long_attention),
       speculative_backend_(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
+      kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       gdn_state_bytes(linear_attention_state_bytes(plan.persistent.decoder.linear_attention)),
@@ -3644,7 +3645,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.effective_max_context = effective_max_context;
     out.yarn_mscale           = yarn_mscale;
     out.kv_capacity           = kv_capacity;
-    out.kv_cache = kv_dtype == DType::BF16 ? KvCacheStorage::BFloat16 : KvCacheStorage::Int8Group64;
+    out.kv_cache = kv_storage;
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

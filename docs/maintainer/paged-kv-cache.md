@@ -606,12 +606,24 @@ blocks；其 Full pool 使用 §4.3 的 head-major page-run order。两者保留
 |---|---|---:|---:|---:|
 | 27B Main Text | BF16 | 65536 | 4.0000 MiB | 3.9375 MiB |
 | 27B Main Text | INT8-G64 | 33792 | 2.0625 MiB | 2.0303 MiB |
+| 27B Main Text | FP8-E4M3-G64 | 33792 | 2.0625 MiB | 2.0303 MiB |
+| 27B Main Text | NVFP4-G16 | 18432 | 1.1250 MiB | 1.1123 MiB |
+| 27B Main Text | K8V4 (FP8 key / NVFP4 value) | 26112 | 1.5938 MiB | 1.5742 MiB |
 | 35B-A3B Main Text | BF16 | 20480 | 1.2500 MiB | 1.2305 MiB |
 | 35B-A3B Main Text | INT8-G64 | 10560 | 0.6445 MiB | 0.6345 MiB |
+| 35B-A3B Main Text | FP8-E4M3-G64 | 10560 | 0.6445 MiB | 0.6345 MiB |
+| 35B-A3B Main Text | NVFP4-G16 | 5760 | 0.3516 MiB | 0.3471 MiB |
+| 35B-A3B Main Text | K8V4 (FP8 key / NVFP4 value) | 8160 | 0.4980 MiB | 0.4932 MiB |
 | 27B MTP | BF16 | 4096 | 0.2500 MiB | 0.2461 MiB |
 | 27B MTP | INT8-G64 | 2112 | 0.1289 MiB | 0.1269 MiB |
+| 27B MTP | FP8-E4M3-G64 | 2112 | 0.1289 MiB | 0.1269 MiB |
+| 27B MTP | NVFP4-G16 | 1152 | 0.0703 MiB | 0.0693 MiB |
+| 27B MTP | K8V4 (FP8 key / NVFP4 value) | 1632 | 0.0996 MiB | 0.0986 MiB |
 | 35B-A3B MTP | BF16 | 2048 | 0.1250 MiB | 0.1230 MiB |
 | 35B-A3B MTP | INT8-G64 | 1056 | 0.0645 MiB | 0.0634 MiB |
+| 35B-A3B MTP | FP8-E4M3-G64 | 1056 | 0.0645 MiB | 0.0634 MiB |
+| 35B-A3B MTP | NVFP4-G16 | 576 | 0.0347 MiB | 0.0342 MiB |
+| 35B-A3B MTP | K8V4 (FP8 key / NVFP4 value) | 816 | 0.0498 MiB | 0.0493 MiB |
 | 35B-A3B DFlash Full | BF16 | 4096 | 0.2500 MiB | 0.2461 MiB |
 
 27B Main Text BF16 的 4 MiB page group 分布在全部 full-attention planes。单层单个 K 或 V plane
@@ -1344,14 +1356,17 @@ INT8-G64 路径在量化坐标上施加固定的归一化 Sylvester D256 正交�
   该 kernel 的 Masked 跳过条件必须用**请求内**列号（`token + column_begin`）与
   `valid_columns[batch]` 比较；用绝对 `output_column`（含 `batch * full_width` 偏移）会跳过
   所有 batch≥1 请求的撤销，使输出残留在旋转后坐标。
-- **路由**：VoltaFlash 路由（width ≥ 64 单 batch prefill）服务 BF16 与 INT8 KV。INT8 分支是
-  旋转感知的：append kernel 一 warp 承载整行 D256，先旋转 K/V 再按 group-64 `absmax/127` 量化
-  （code/scale 布局与未旋转路径一致）；INT8 Q staging 施加同一行旋转（普通 Flash 的
-  `volta_flash_convert_q_i8_kernel` 与 split-D 的 `prepare_q_rotated`）；输出侧在 stream-K
-  fixup / split-D 合并归一化之后，由 `volta_flash_convert_out_i8_kernel` 把 FP32 结果逆旋转
-  恰好一次再转 BF16（融合进既有转换 kernel，不新增独立旋转 kernel 或中间张量）。已有旋转缓存
-  与新追加数据因此共享同一坐标。BF16 分支保持逐元素 kernel 与变更前行为。见
-  `gqa_attention.cpp` 的 `volta_flash_route_possible`（`DType::BF16 || DType::I8`）。
+- **路由**：VoltaFlash 路由（width ≥ 64 单 batch prefill）服务 BF16 与全部量化 KV 格式
+  （INT8/FP8/NVFP4/K8V4，见 17.10）。INT8 分支是旋转感知的：append kernel 一 warp 承载整行 D256，
+  先旋转 K/V 再按 group-64 `absmax/127` 量化（code/scale 布局与未旋转路径一致）；INT8 Q staging
+  施加同一行旋转（普通 Flash 的 `volta_flash_convert_q_i8_kernel` 与 split-D 的
+  `prepare_q_rotated`）；输出侧在 stream-K fixup / split-D 合并归一化之后，由
+  `volta_flash_convert_out_i8_kernel` 把 FP32 结果逆旋转恰好一次再转 BF16（融合进既有转换
+  kernel，不新增独立旋转 kernel 或中间张量）。已有旋转缓存与新追加数据因此共享同一坐标。
+  BF16 分支保持逐元素 kernel 与变更前行为。新格式的 Flash 分支共用同一三段结构（codec append、
+  按格式反量化 gather、旋转感知的 Q staging 与一次性逆旋转），由 view 的 `storage` 字段分派。
+  见 `gqa_attention.cpp` 的 `volta_flash_route_possible`
+  （`BFloat16 || Int8Group64 || Fp8E4M3Group64 || Nvfp4Group16 || Fp8KeyNvfp4Value`）。
 - **判定口径**：旋转改变 FP32 加法结合顺序，logits、MTP 接受率与生成 token 与未旋转路径**不逐位一致**，
   属预期。正确性以独立朴素 FP32 oracle 的容差等价判定（`tests/ops/test_hadamard_d256.cpp` 给出变换的
   正交性/自逆性与 group-64 量化失真不劣化的 CPU 证据；`test_hadamard_d256_device.cu` 与 vendored
@@ -1363,6 +1378,52 @@ INT8-G64 路径在量化坐标上施加固定的归一化 Sylvester D256 正交�
   的测量判定，不由本层替代。
 - **禁止**：为旋转引入独立的量化/反量化/旋转 kernel 或中间张量（会破坏减半带宽目标）；对 BF16 路径
   施加旋转；只旋转 K 不旋转 V（收益减半且与输出侧撤销不对称）。
+
+### 17.10 FP8 / NVFP4 / K8V4 codec 几何、scale 语义与路由
+
+p4 变更加入的三种量化 KV 存储（`--kv-dtype fp8|nvfp4|k8v4`），与 INT8-G64 共享旋转坐标契约
+（17.9）：量化输入恒为 D256 旋转后的行。
+
+- **平面几何**（单源 `kv_cache_plane_geometry`，`src/core/paged_kv_cache.cpp`；7.4 表格的新行由此重算）：
+  - **FP8 E4M3 G64**（`fp8`）：code = 每旋转维 1 个 E4M3 字节（256 B）+ 每 64 维 1 个 FP16 scale
+    （8 B）= 264 B/(层,头,token)，与 INT8-G64 逐字节等宽；
+  - **NVFP4 G16**（`nvfp4`）：code = 每字节 2 个 E2M1 码（128 B）+ 每 16 维 1 个 E4M3 scale 字节
+    （16 B）= 144 B；
+  - **K8V4**（`k8v4`，非对称）：key 平面用 FP8 几何（264 B），value 平面用 NVFP4 几何（144 B）
+    = 408 B。两平面独立、互不混用（`decoder_state.cpp::plan_cache` 由几何构建 4 个独立平面，
+    `test_kv_cache.cpp::check_k8v4_planes` 断言平面 region 两两不相交）。
+- **scale 语义**：FP8 scale = 组 absmax（FP16 舍入），code = E4M3(x/scale)（`__nv_cvt_float_to_fp8`
+  satfinite，sm_70 上为软件路径，与参考逐位一致）；NVFP4 scale = 组 absmax/6（E4M3 字节），
+  code = E2M1(x/scale)，用软件 RN-even 打包器（E2M1 硬件 cvt 仅 Blackwell，sm_70 会 `__trap`）。
+- **kernel 分派**：注意力 kernel（Volta TC small-T decode、SIMT tiled、QPN、prefill fill、
+  `gqa_kv_append`）经单一 codec 策略模板参数选择算术：`KvI8G64` / `KvFp8G64`
+  （`gqa_attention_kv_g64_codec.cuh`）、`KvNvfp4G16`（`gqa_attention_nvfp4_g16_codec.cuh`）、
+  `KvK8V4`（`gqa_attention_k8v4_codec.cuh`，K 方法委托 `KvFp8G64`、V 方法委托 `KvNvfp4G16`）。
+  量化/反量化全部融合进注意力与 append kernel；codec 头只含 `__device__` 助手，
+  无独立 `__global__` 量化/反量化 kernel（T0 `!__global__` 断言门控）。
+- **路由**：`volta_flash_route_possible` 放行三种新 storage（BF16/INT8 谓词行为不变）。Flash 三段
+  结构按格式分派：append 的量化委托 `KvCodec::quantize_row`（一 warp 一行，
+  `volta_flash_append_kv_codec_kernel`）；gather 按格式反量化（FP8 为 E4M3×FP16 scale，
+  NVFP4 为 E2M1 nibble×E4M3 scale，K8V4 的 K/V 各走各的 codec）；Q staging 与一次性逆旋转由
+  `storage != BFloat16` 统一驱动。路由/容量的公开入口按 code dtype 反推 storage
+  （`kv_storage_for_code_dtype`）：K8V4 反推为 `Fp8E4M3Group64`，同在接受集合内，故"是否走
+  Flash"的布尔决策正确；真实按格式分派由 launcher 经 `PagedKVBatchLayerView::storage`
+  完成，公开 API 签名不变。
+- **容量口径**（27B 生产 TP2：2 kv 头/GPU、16 full-attention 层、head_dim 256）：每 token KV =
+  FP8 16,896 B（=INT8）/ NVFP4 9,216 B（0.5455×）/ K8V4 13,056 B（0.7727×）；420,096-token 共享池
+  = 6.6105 / 3.6057 / 5.1081 GiB/GPU；同 VRAM 预算 K8V4 可容 543,653 token（1.294× INT8）。
+  并发上限（2 lane + 共享池 token 上限）格式无关。规格仓库
+  `openspec/changes/p4-kv-storage-formats/evidence/` 的三篇 `*-capacity.md` 为单源重算记录。
+- **容差契约**（scheme-relative，独立朴素 FP32 oracle；规格仓库
+  `evidence/*-oracle-tolerances.md`）：`kAttentionFp8Criterion.rel_l2` 3.4e-3、
+  `kAttentionNvfp4Criterion` 4.0e-3、`kAttentionK8V4Criterion` 3.3e-3（最坏实测 + ~11% 余量）；
+  outlier-channel 回归界 FP8 0.030 / NVFP4 0.110 / K8V4 0.141（漏旋转缺陷落在 ≈1.4，约 10× 于界，
+  界可判别旋转契约）。
+- **已知缺陷史**（防回归）：① Volta TC 小 T 门控曾只认 `is_fp8||is_nvfp4`，K8V4 被误路由进
+  INT8-only SIMT tiled kernel（把 128 B NVFP4 value 平面按 256 int8 读 → OOB illegal memory
+  access），已在 `gqa_attention_decode.cu` 三处门控补 `kv_codec_is_k8v4`；② NVFP4
+  `quantize_row` 的 E2M1 打包曾因 `__shfl_sync` 用全 warp mask 而 Volta 死锁（仅 16 个 active
+  lane 到达 shuffle 点），改为 16-lane block 受限 mask（`0xFFFFu << base` + 源钳制）后修复。
 
 ---
 

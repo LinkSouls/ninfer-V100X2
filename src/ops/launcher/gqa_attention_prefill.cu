@@ -5,6 +5,9 @@
 #include "ops/common/math.h"
 #include "ops/kernel/gqa_attention_prefill_bf16.cuh"
 #include "ops/kernel/gqa_attention_prefill_i8.cuh"
+#include "ops/kernel/gqa_attention_kv_g64_codec.cuh"
+#include "ops/kernel/gqa_attention_nvfp4_g16_codec.cuh"
+#include "ops/kernel/gqa_attention_k8v4_codec.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "ops/launcher/gqa_geometry_dispatch.cuh"
 #include "ops/launcher/kernel_attr_once.h"
@@ -63,7 +66,12 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
-    if (cache.dtype == DType::I8) {
+    // The quantized (INT8 / FP8-E4M3 / NVFP4) fill path is codec-generic: the D256 row rotation, the
+    // grid and the scale-plane layout are shared; only the code<->value arithmetic and the code/scale
+    // byte types differ (see gqa_attention_kv_g64_codec.cuh / gqa_attention_nvfp4_g16_codec.cuh).
+    // INT8 keeps its bit-identical P3 path via KvI8G64; FP8 appends E4M3 codes via KvFp8G64; NVFP4
+    // appends packed E2M1 codes with a group-16 E4M3 scale via KvNvfp4G16.
+    const auto launch_quantized_fill = [&]<typename KvCodec>() {
         Tensor& cache_k_scale    = cache.k_scale_pages;
         Tensor& cache_v_scale    = cache.v_scale_pages;
         constexpr int kFillBlock = 256;
@@ -73,32 +81,42 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
             const int max_tiles          = div_up(tokens + kTokensPerTile - 1, kTokensPerTile);
             const dim3 fill_grid(static_cast<unsigned>(max_tiles),
                                  static_cast<unsigned>(Geometry::KVHeads));
-            gqa_attention_prefill_fill_i8_page_kernel<Geometry, Metadata>
+            gqa_attention_prefill_fill_i8_page_kernel<Geometry, Metadata, KvCodec>
                 <<<fill_grid, kPageBlock, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(k.data),
                     static_cast<const __nv_bfloat16*>(v.data),
                     static_cast<const std::int32_t*>(positions.data), metadata,
-                    static_cast<std::int8_t*>(cache_k.data),
-                    static_cast<std::int8_t*>(cache_v.data),
-                    static_cast<__half*>(cache_k_scale.data),
-                    static_cast<__half*>(cache_v_scale.data), tokens);
+                    static_cast<KvCodec::Code*>(cache_k.data),
+                    static_cast<KvCodec::Code*>(cache_v.data),
+                    static_cast<KvCodec::KScale*>(cache_k_scale.data),
+                    static_cast<KvCodec::VScale*>(cache_v_scale.data), tokens);
         } else {
             constexpr int kFillWarps = kFillBlock / 32;
             const std::int64_t fill_units =
                 static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
             const int fill_grid =
                 static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
-            gqa_attention_prefill_fill_i8_kernel<Geometry, Metadata>
+            gqa_attention_prefill_fill_i8_kernel<Geometry, Metadata, KvCodec>
                 <<<fill_grid, kFillBlock, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(k.data),
                     static_cast<const __nv_bfloat16*>(v.data),
                     static_cast<const std::int32_t*>(positions.data), metadata,
-                    static_cast<std::int8_t*>(cache_k.data),
-                    static_cast<std::int8_t*>(cache_v.data),
-                    static_cast<__half*>(cache_k_scale.data),
-                    static_cast<__half*>(cache_v_scale.data), tokens);
+                    static_cast<KvCodec::Code*>(cache_k.data),
+                    static_cast<KvCodec::Code*>(cache_v.data),
+                    static_cast<KvCodec::KScale*>(cache_k_scale.data),
+                    static_cast<KvCodec::VScale*>(cache_v_scale.data), tokens);
         }
         CUDA_CHECK(cudaGetLastError());
+    };
+    if (cache.dtype == DType::I8) {
+        launch_quantized_fill.template operator()<KvI8G64>();
+    } else if (cache.dtype == DType::FP8_E4M3FN &&
+               cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        launch_quantized_fill.template operator()<KvK8V4>();
+    } else if (cache.dtype == DType::FP8_E4M3FN) {
+        launch_quantized_fill.template operator()<KvFp8G64>();
+    } else if (cache.dtype == DType::U8) {
+        launch_quantized_fill.template operator()<KvNvfp4G16>();
     } else {
         constexpr int kBlock           = Geometry::KVHeads == 4 ? 128 : 96;
         constexpr int kFillVecElems    = 8;

@@ -42,6 +42,54 @@ void validate_distinct_pools(std::span<const PagedKVReservation> reservations) {
 
 } // namespace
 
+KvCachePlaneGeometry kv_cache_plane_geometry(KvCacheStorage storage, std::int32_t head_dim) {
+    KvCachePlaneGeometry g;
+    switch (storage) {
+    case KvCacheStorage::BFloat16:
+        g.k_code = g.v_code = DType::BF16;
+        g.k_code_extent = g.v_code_extent = head_dim;
+        break;
+    case KvCacheStorage::Int8Group64:
+        g.k_code = g.v_code = DType::I8;
+        g.k_scale = g.v_scale = DType::FP16;
+        g.k_group = g.v_group = 64;
+        g.k_code_extent = g.v_code_extent = head_dim;
+        g.k_scale_extent = g.v_scale_extent = head_dim / 64;
+        g.quantized = true;
+        break;
+    case KvCacheStorage::Fp8E4M3Group64:
+        g.k_code = g.v_code = DType::FP8_E4M3FN;
+        g.k_scale = g.v_scale = DType::FP16;
+        g.k_group = g.v_group = 64;
+        g.k_code_extent = g.v_code_extent = head_dim;
+        g.k_scale_extent = g.v_scale_extent = head_dim / 64;
+        g.quantized = true;
+        break;
+    case KvCacheStorage::Nvfp4Group16:
+        g.k_code = g.v_code = DType::U8; // two E2M1 codes per byte
+        g.k_scale = g.v_scale = DType::FP8_E4M3FN;
+        g.k_group = g.v_group = 16;
+        g.k_code_extent = g.v_code_extent = head_dim / 2;
+        g.k_scale_extent = g.v_scale_extent = head_dim / 16;
+        g.quantized = true;
+        break;
+    case KvCacheStorage::Fp8KeyNvfp4Value:
+        g.k_code = DType::FP8_E4M3FN;
+        g.v_code = DType::U8;
+        g.k_scale = DType::FP16;
+        g.v_scale = DType::FP8_E4M3FN;
+        g.k_group = 64;
+        g.v_group = 16;
+        g.k_code_extent  = head_dim;
+        g.v_code_extent  = head_dim / 2;
+        g.k_scale_extent = head_dim / 64;
+        g.v_scale_extent = head_dim / 16;
+        g.quantized = true;
+        break;
+    }
+    return g;
+}
+
 PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSpec& spec) {
     const std::int32_t physical_pages = checked_i32(spec.page_group_count, "Paged KV page count");
     const std::int32_t logical_pages =

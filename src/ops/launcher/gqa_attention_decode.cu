@@ -5,6 +5,9 @@
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_decode_bf16.cuh"
 #include "ops/kernel/gqa_attention_decode_i8.cuh"
+#include "ops/kernel/gqa_attention_kv_g64_codec.cuh"
+#include "ops/kernel/gqa_attention_nvfp4_g16_codec.cuh"
+#include "ops/kernel/gqa_attention_k8v4_codec.cuh"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/launcher/gqa_attention_qpn_volta.h"
 #include "ops/kernel/gqa_attention_decode_i8_tc_volta.cuh"
@@ -163,7 +166,8 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput,
+          typename KvCodec = KvI8G64>
 void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                           PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t implementation_window,
@@ -175,6 +179,15 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     Tensor& cache_k_scale = cache.k_scale_pages;
     Tensor& cache_v_scale = cache.v_scale_pages;
 
+    // FP8 small-T decode is served by the Volta tensor-core kernel for every token tile (the
+    // SIMT tiled kernel quantizes Q to int8 in shared memory and has no FP8 sibling). NVFP4 is
+    // the same: it has no SIMT path, so both fail at compile time on a non-Volta build.
+#if !defined(NINFER_VOLTA_BUILD)
+    static_assert(!kv_codec_is_fp8<KvCodec>::value && !kv_codec_is_nvfp4<KvCodec>::value &&
+                  !kv_codec_is_k8v4<KvCodec>::value,
+                  "FP8/NVFP4/K8V4 small-T decode requires the Volta tensor-core path (NINFER_VOLTA_BUILD)");
+#endif
+
 #ifdef NINFER_VOLTA_BUILD
     if constexpr ((Geometry::QHeads == 12 || Geometry::QHeads == 6) &&
                   (TokenTile == 5 || TokenTile == 6)) {
@@ -185,7 +198,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 new_k = input.k;
                 new_v = input.v;
             }
-            gqa_attention_verify_qpn_volta_launch(q, new_k, new_v, pos, scale, cache,
+            gqa_attention_verify_qpn_volta_launch<KvCodec>(q, new_k, new_v, pos, scale, cache,
                 invocation, logical_capacity, splits, partial_acc, partial_m, partial_l, stream);
             return;
         }
@@ -198,23 +211,26 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 new_k = input.k;
                 new_v = input.v;
             }
-            gqa_attention_single_qpn_volta_launch(q, new_k, new_v, pos, scale, cache,
+            gqa_attention_single_qpn_volta_launch<KvCodec>(q, new_k, new_v, pos, scale, cache,
                 invocation, logical_capacity, volta_long_attention, splits,
                 partial_acc, partial_m, partial_l, stream);
             return;
         }
     }
-    if constexpr (TokenTile >= kVoltaTcDecodeMinWidth) {
+    // FP8 and NVFP4 use the Volta tensor-core kernel for every token tile (including the 1/2 that
+    // INT8 keeps on the SIMT kernel); see the static_assert above for why they have no SIMT path.
+    if constexpr (TokenTile >= kVoltaTcDecodeMinWidth || kv_codec_is_fp8<KvCodec>::value ||
+                  kv_codec_is_nvfp4<KvCodec>::value || kv_codec_is_k8v4<KvCodec>::value) {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
         auto launch_volta = [&]<int Warps, bool Fp32Pv = false>() {
             gqa_attention_small_t_tc_volta_partial_i8_kernel<Geometry, TokenTile, Warps,
                                                              MultiBatch, Masked, CacheInput,
-                                                             Warps == 8, Fp32Pv>
+                                                             Warps == 8, Fp32Pv, KvCodec>
                 <<<grid, Warps * 32, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data), input,
                     static_cast<const std::int32_t*>(pos.data),
-                    static_cast<std::int8_t*>(cache_k.data), static_cast<std::int8_t*>(cache_v.data),
-                    static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data),
+                    static_cast<KvCodec::Code*>(cache_k.data), static_cast<KvCodec::Code*>(cache_v.data),
+                    static_cast<KvCodec::KScale*>(cache_k_scale.data), static_cast<KvCodec::VScale*>(cache_v_scale.data),
                     static_cast<const std::int32_t*>(cache.block_tables.data),
                     invocation.valid_columns == nullptr
                         ? nullptr
@@ -258,6 +274,11 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     }
 #endif // NINFER_VOLTA_BUILD
 
+    // SIMT tiled kernel is INT8-only (it stages Q as int8 in shared memory). FP8 and NVFP4 never reach
+    // this on Volta (the tensor-core branch above returns for every token tile), so drop the
+    // instantiation for both to keep the int8 casts valid.
+    if constexpr (!kv_codec_is_fp8<KvCodec>::value && !kv_codec_is_nvfp4<KvCodec>::value &&
+              !kv_codec_is_k8v4<KvCodec>::value) {
     auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
         constexpr std::size_t kDynamicBytes =
@@ -372,6 +393,56 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         }
     }
     CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+// FP8 small-T decode: the tensor-core path only (the SIMT tiled kernel is INT8-only; see the
+// static_assert in launch_tc_partial_i8). Forwards to launch_tc_partial_i8 with the FP8 group-64
+// codec, so FP8 inherits the same tile topology, Q rotation staging and one-time inverse-rotation
+// epilogue, differing only in the E4M3 append/staging arithmetic.
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+void launch_tc_partial_fp8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                           PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
+                           std::int32_t logical_capacity, std::int32_t implementation_window,
+                           bool volta_long_attention,
+                           std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
+                           Tensor& partial_l, cudaStream_t stream) {
+    launch_tc_partial_i8<Geometry, TokenTile, MultiBatch, Masked, CacheInput, KvFp8G64>(
+        q, input, pos, scale, cache, invocation, logical_capacity, implementation_window,
+        volta_long_attention, splits, partial_acc, partial_m, partial_l, stream);
+}
+
+// NVFP4 small-T decode: the tensor-core path only (the SIMT tiled kernel is INT8-only; see the
+// static_assert in launch_tc_partial_i8). Forwards to launch_tc_partial_i8 with the NVFP4 group-16
+// codec, so NVFP4 inherits the same tile topology, Q rotation staging and one-time inverse-rotation
+// epilogue, differing only in the E2M1/E4M3 append/staging arithmetic.
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                             PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
+                             std::int32_t logical_capacity, std::int32_t implementation_window,
+                             bool volta_long_attention,
+                             std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
+                             Tensor& partial_l, cudaStream_t stream) {
+    launch_tc_partial_i8<Geometry, TokenTile, MultiBatch, Masked, CacheInput, KvNvfp4G16>(
+        q, input, pos, scale, cache, invocation, logical_capacity, implementation_window,
+        volta_long_attention, splits, partial_acc, partial_m, partial_l, stream);
+}
+
+// K8V4 small-T decode: the tensor-core path only (the SIMT tiled kernel is INT8-only; see the
+// static_assert in launch_tc_partial_i8). Forwards to launch_tc_partial_i8 with the asymmetric
+// K8V4 codec (FP8 group-64 key plane + NVFP4 group-16 value plane), so K8V4 inherits the same tile
+// topology, Q rotation staging and one-time inverse-rotation epilogue, differing only in the
+// per-plane append/staging arithmetic.
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+void launch_tc_partial_k8v4(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                            PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
+                            std::int32_t logical_capacity, std::int32_t implementation_window,
+                            bool volta_long_attention,
+                            std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
+                            Tensor& partial_l, cudaStream_t stream) {
+    launch_tc_partial_i8<Geometry, TokenTile, MultiBatch, Masked, CacheInput, KvK8V4>(
+        q, input, pos, scale, cache, invocation, logical_capacity, implementation_window,
+        volta_long_attention, splits, partial_acc, partial_m, partial_l, stream);
 }
 
 PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
@@ -385,6 +456,7 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .num_kv_heads  = cache.num_kv_heads,
         .dtype         = cache.dtype,
         .quant_group   = cache.quant_group,
+        .storage       = cache.storage,
     };
 }
 
@@ -394,7 +466,9 @@ bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tok
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+    if (tokens < 1 || tokens > 6 ||
+        (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
+         cache_dtype != DType::FP8_E4M3FN && cache_dtype != DType::U8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
@@ -423,6 +497,22 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
             if (cache.dtype == DType::I8) {                                                        \
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
+                    q, input, pos, scale, cache, invocation, logical_capacity,                     \
+                    implementation_window, envelope.volta_long_attention, splits,                 \
+                    partial_acc, partial_m, partial_l, stream);                                     \
+            } else if (cache.dtype == DType::FP8_E4M3FN && \
+               cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) { \
+                launch_tc_partial_k8v4<Geometry, (TOKENS), MultiBatch, Masked>( \
+                    q, input, pos, scale, cache, invocation, logical_capacity, \
+                    implementation_window, envelope.volta_long_attention, splits, \
+                    partial_acc, partial_m, partial_l, stream); \
+            } else if (cache.dtype == DType::FP8_E4M3FN) {                                         \
+                launch_tc_partial_fp8<Geometry, (TOKENS), MultiBatch, Masked>(                     \
+                    q, input, pos, scale, cache, invocation, logical_capacity,                     \
+                    implementation_window, envelope.volta_long_attention, splits,                 \
+                    partial_acc, partial_m, partial_l, stream);                                     \
+            } else if (cache.dtype == DType::U8) {                                                \
+                launch_tc_partial_nvfp4<Geometry, (TOKENS), MultiBatch, Masked>(                   \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, envelope.volta_long_attention, splits,                 \
                     partial_acc, partial_m, partial_l, stream);                                     \
@@ -537,11 +627,13 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
             launch_profile.template operator()<Int8, true, false>();
         }
     };
-    if (cache.dtype == DType::I8) {
+    // INT8, FP8 E4M3 and NVFP4 KV all store their values in rotated-V coordinates (the P3 D256
+    // contract), so all three take the inverse-rotation epilogue below; BF16 V is never rotated.
+    if (cache.dtype == DType::I8 || cache.dtype == DType::FP8_E4M3FN || cache.dtype == DType::U8) {
         launch_for_dtype.template operator()<true>();
-        // Undo the INT8 KV value rotation on the combined output. The reduce kernel above works in
-        // the rotated-V coordinates; this one-time transform (see the kernel's comment) restores
-        // the un-rotated attention output. BF16 needs no inverse (its V was never rotated).
+        // Undo the KV value rotation on the combined output. The reduce kernel above works in the
+        // rotated-V coordinates; this one-time transform (see the kernel's comment) restores the
+        // un-rotated attention output. BF16 needs no inverse (its V was never rotated).
         const dim3 inv_grid(Geometry::QHeads, invocation.width * invocation.batch_size);
         const auto launch_inverse = [&]<bool MultiBatch, bool Masked, bool Offset>() {
             gqa_attention_small_t_inverse_rotate_kernel<Geometry, MultiBatch, Masked, Offset>

@@ -2,7 +2,7 @@
 
 #include "ops/common/volta_mma.cuh"
 #include "ops/kernel/gqa_attention_decode.cuh"
-#include "ops/kernel/gqa_attention_kv_quant.cuh"
+#include "ops/kernel/gqa_attention_kv_g64_codec.cuh"
 #include "ops/kernel/hadamard_d256.cuh"
 
 namespace ninfer::ops {
@@ -14,10 +14,12 @@ namespace ninfer::ops {
 // representation is resident. Eight dimension warps accumulate PV in FP32.
 // This 32-key softmax/partition profile is not bit-equivalent to the 16-key TC
 // verifier; both are checked against the same decoded-input attention oracle.
-template <typename G, bool MultiBatch, bool Masked, typename CacheInput>
+template <typename G, bool MultiBatch, bool Masked, typename CacheInput,
+          typename KvCodec = KvI8G64>
 __global__ __launch_bounds__(256, 2) void gqa_attention_verify5_qpn_volta_partial_i8_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
-    std::int8_t* keys, std::int8_t* values, half* key_scales, half* value_scales,
+    typename KvCodec::Code* keys, typename KvCodec::Code* values,
+    typename KvCodec::KScale* key_scales, typename KvCodec::VScale* value_scales,
     const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
@@ -124,30 +126,9 @@ __global__ __launch_bounds__(256, 2) void gqa_attention_verify5_qpn_volta_partia
             }
             gqa_hadamard_d256_inplace(k_vals, lane);
             gqa_hadamard_d256_inplace(v_vals, lane);
-#pragma unroll
-            for (int grp = 0; grp < kGqaKvQuantGroups; ++grp) {
-                const int d0  = grp * kGqaKvQuantGroup + lane;
-                const int d1  = d0 + 32;
-                const float k0 = k_vals[2 * grp];
-                const float k1 = k_vals[2 * grp + 1];
-                const float v0 = v_vals[2 * grp];
-                const float v1 = v_vals[2 * grp + 1];
-                const float ka = warp_max(fmaxf(fabsf(k0), fabsf(k1)), Mask);
-                const float va = warp_max(fmaxf(fabsf(v0), fabsf(v1)), Mask);
-                const half kscale = __float2half_rn(ka > 0.0f ? ka / 127.0f : 0.0f);
-                const half vscale = __float2half_rn(va > 0.0f ? va / 127.0f : 0.0f);
-                const float ki = __half2float(kscale) > 0.0f ? 1.0f / __half2float(kscale) : 0.0f;
-                const float vi = __half2float(vscale) > 0.0f ? 1.0f / __half2float(vscale) : 0.0f;
-                keys[gqa_kv_quant_code_index<G>(page, head, d0, offset)] = gqa_kv_quant_code(k0, ki);
-                keys[gqa_kv_quant_code_index<G>(page, head, d1, offset)] = gqa_kv_quant_code(k1, ki);
-                values[gqa_kv_quant_code_index<G>(page, head, d0, offset)] = gqa_kv_quant_code(v0, vi);
-                values[gqa_kv_quant_code_index<G>(page, head, d1, offset)] = gqa_kv_quant_code(v1, vi);
-                if (lane == 0) {
-                    const auto index = gqa_kv_quant_scale_index<G>(page, head, grp, offset);
-                    key_scales[index] = kscale;
-                    value_scales[index] = vscale;
-                }
-            }
+            // Fused per-format quantize (group-64 INT8/FP8 verbatim; NVFP4 packs 2 E2M1/byte).
+            KvCodec::template quantize_row<G>(k_vals, v_vals, page, head, offset, keys, values, key_scales,
+                                     value_scales);
         }
     }
     __syncthreads();
@@ -174,22 +155,20 @@ __global__ __launch_bounds__(256, 2) void gqa_attention_verify5_qpn_volta_partia
             if (key < end) {
                 const int page = pages[(key >> kPagedKVPageShift) - first_page];
                 const int offset = key & kPagedKVPageMask;
-                const auto code = gqa_kv_quant_code_index<G>(page, head, dim, offset);
-                const auto group = gqa_kv_quant_scale_index<G>(page, head, dim / 64, offset);
-                const half kscale = key_scales[group], vscale = value_scales[group];
-#pragma unroll
-                for(int c=0;c<16;c+=16) {
-                    const uint4 kr = __ldcs(reinterpret_cast<const uint4*>(keys + code + c));
-                    const uint4 vr = __ldcs(reinterpret_cast<const uint4*>(values + code + c));
-                    store_vec(ks+local*Stride+dim+c,
-                        gqa_kv_dequant_i8x8_f16(make_int2(kr.x,kr.y),kscale));
-                    store_vec(ks+local*Stride+dim+c+8,
-                        gqa_kv_dequant_i8x8_f16(make_int2(kr.z,kr.w),kscale));
-                    store_vec(vs+local*Stride+dim+c,
-                        gqa_kv_dequant_i8x8_f16(make_int2(vr.x,vr.y),vscale));
-                    store_vec(vs+local*Stride+dim+c+8,
-                        gqa_kv_dequant_i8x8_f16(make_int2(vr.z,vr.w),vscale));
-                }
+                const auto kcode = KvCodec::template k_code_index<G>(page, head, dim, offset);
+                const auto vcode = KvCodec::template v_code_index<G>(page, head, dim, offset);
+                const auto kgroup = KvCodec::template k_scale_index<G>(page, head, dim, offset);
+                const auto vgroup = KvCodec::template v_scale_index<G>(page, head, dim, offset);
+                const typename KvCodec::KScale kscale = key_scales[kgroup],
+                                              vscale = value_scales[vgroup];
+                // One 16-dim chunk: g64 reads 16 code bytes (one/dim); NVFP4 reads 8 (two E2M1/byte).
+                int4 klo, khi, vlo, vhi;
+                KvCodec::k_dequant16_from(keys + kcode, kscale, klo, khi);
+                KvCodec::v_dequant16_from(values + vcode, vscale, vlo, vhi);
+                store_vec(ks + local * Stride + dim, klo);
+                store_vec(ks + local * Stride + dim + 8, khi);
+                store_vec(vs + local * Stride + dim, vlo);
+                store_vec(vs + local * Stride + dim + 8, vhi);
             } else {
 #pragma unroll
                 for(int c=0;c<16;c+=8) {
@@ -206,10 +185,12 @@ __global__ __launch_bounds__(256, 2) void gqa_attention_verify5_qpn_volta_partia
                 const int next_key = tile + Bc + tid / 2;
                 if (next_key < end) {
                     const int page = pages[(next_key >> kPagedKVPageShift) - first_page];
-                    const auto code = gqa_kv_quant_code_index<G>(
+                    const auto kcode = KvCodec::template k_code_index<G>(
                         page, head, (tid & 1) * 128, next_key & kPagedKVPageMask);
-                    asm volatile("prefetch.global.L2 [%0];" : : "l"(keys + code));
-                    asm volatile("prefetch.global.L2 [%0];" : : "l"(values + code));
+                    const auto vcode = KvCodec::template v_code_index<G>(
+                        page, head, (tid & 1) * 128, next_key & kPagedKVPageMask);
+                    asm volatile("prefetch.global.L2 [%0];" : : "l"(keys + kcode));
+                    asm volatile("prefetch.global.L2 [%0];" : : "l"(values + vcode));
                 }
             }
         }
