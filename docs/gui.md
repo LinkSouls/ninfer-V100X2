@@ -157,7 +157,7 @@ GUI 是 API 启动器；图片/视频由客户端通过既有 OpenAI/Anthropic �
 
 - “NVFP4 / MTP 快速数值路径”：`--volta-fast-decode`，QUASAR / SM70 / TP2/TP4 / 纯文本 None/MTP；
   NVFP4 全局缩放移到 FP32 K 归约后，并启用 MTP W8 特定分区/归约。
-- “完整历史长注意力（文本 / 图片 / 视频）”：`--volta-long-attention`，SM70 27B / TP2/TP4（视觉仅 TP2）/ INT8 KV / 实验性并发1–8 / 文本或视觉 None/MTP；
+- “完整历史长注意力（文本 / 图片 / 视频）”：`--volta-long-attention`，SM70 27B / TP2/TP4（视觉仅 TP2）/ INT8 或 FP8 KV / 实验性并发1–8 / 文本或视觉 None/MTP；NVFP4/K8V4 长注意力为后续独立变更；
   保留每个历史 KV，但改变 softmax、PV 和归约顺序。
 
 本机 TP2 纯文本组合在 85K 实际输入、180K 容量、MTP4、greedy、Graph 下测得 **198.105 / 198.097 committed tok/s**。

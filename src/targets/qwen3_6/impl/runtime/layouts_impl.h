@@ -683,11 +683,10 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
     if (!options.enable_vision && options.vision_device != VisionDevice::Gpu) {
         throw std::invalid_argument("CPU Vision requires enable_vision");
     }
-    if (options.volta_long_attention &&
-        (TextConfig::query_heads != 24 || device.sm() != 70 || (options.tp != 2 && options.tp != 4) || options.pp != 1 ||
-         options.kv_cache != KvCacheStorage::Int8Group64 || options.ram_kv.gpu_tokens != 0 ||
-         options.speculative.backend == SpeculativeBackend::DFlash)) {
-        throw std::invalid_argument("Volta long attention requires SM70 27B TP2/TP4 Text/None/MTP (Vision on TP2 only) with complete INT8 KV");
+    if (!engine_options_admit_volta_long_attention(device.sm(), TextConfig::query_heads, options)) {
+        throw std::invalid_argument(
+            "Volta long attention requires SM70 27B TP2/TP4 Text/None/MTP (Vision on TP2 only) "
+            "with complete INT8 or FP8 KV");
     }
     if (options.ram_kv.gpu_tokens != 0) {
         if constexpr (TextConfig::query_heads != 24) {

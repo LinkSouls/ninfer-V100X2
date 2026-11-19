@@ -46,7 +46,7 @@
   default-off and limited to QUASAR SM70 TP2 Text/None/MTP. The normal route retains
   per-group FP16 scaling. Codes/scales remain unchanged; arithmetic and draft acceptance
   may change. The ~198.1 tok/s result combines this switch with long attention.
-- **Optional long attention:** `--volta-long-attention` keeps complete INT8 KV history but
+- **Optional long attention:** `--volta-long-attention` keeps complete INT8 or FP8 KV history but
   retunes long TP2 partitions, online softmax and FP32 PV accumulation. It supports experimental 1–8-request
   Text/None/MTP on SM70, excludes DFlash/RAM-KV/Vision, and can change generated output.
   Five-query verification uses four eight-row QK warps with distributed Q fragments and inline

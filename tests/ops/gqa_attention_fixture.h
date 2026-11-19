@@ -1186,8 +1186,11 @@ public:
         PagedKVLayerView result;
         const bool k8v4 = storage_ == KvCacheStorage::Fp8KeyNvfp4Value;
         const std::int32_t v_code_extent = (k8v4 || dtype_ == DType::U8) ? kHeadDim / 2 : kHeadDim;
+        // NVFP4 (U8) packs two E2M1 codes per byte on the key plane (kHeadDim/2 bytes/row); K8V4's
+        // key plane is full-width FP8. Mirror the wrapper's k_code_extent so k_pages matches layout.
+        const std::int32_t k_code_extent = (dtype_ == DType::U8 && !k8v4) ? kHeadDim / 2 : kHeadDim;
         result.k_pages      = Tensor(k_.data(), dtype_,
-                                     {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
+                                     {k_code_extent, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
         result.v_pages      = Tensor(v_.data(), k8v4 ? DType::U8 : dtype_,
                                      {v_code_extent, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
         result.block_table  = Tensor(block_table_.data(), DType::I32, {logical_pages_});
@@ -1435,8 +1438,11 @@ public:
         PagedKVBatchLayerView result;
         const bool k8v4 = storage_ == KvCacheStorage::Fp8KeyNvfp4Value;
         const std::int32_t v_code_extent = (k8v4 || dtype_ == DType::U8) ? kHeadDim / 2 : kHeadDim;
+        // NVFP4 (U8) packs two E2M1 codes per byte on the key plane (kHeadDim/2 bytes/row); K8V4's
+        // key plane is full-width FP8. Mirror the wrapper's k_code_extent so k_pages matches layout.
+        const std::int32_t k_code_extent = (dtype_ == DType::U8 && !k8v4) ? kHeadDim / 2 : kHeadDim;
         result.k_pages      = Tensor(k_.data(), dtype_,
-                                     {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
+                                     {k_code_extent, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
         result.v_pages      = Tensor(v_.data(), k8v4 ? DType::U8 : dtype_,
                                      {v_code_extent, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
         result.block_tables = Tensor(block_tables_.data(), DType::I32,

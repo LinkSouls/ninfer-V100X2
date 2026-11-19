@@ -4,6 +4,7 @@
 #include <ninfer/targets/qwen3_6/mtp_alignment.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/vision_control.h>
+#include <ninfer/types.h>
 
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
@@ -113,7 +114,8 @@ void test_round_layout() {
     ninfer::LayoutBuilder builder;
     q36::RoundStateLayout round = q36::begin_round_state_layout(
         builder, q36::RoundStateSpec{
-                     .hidden = 32, .output_rows = 128, .draft_window = 5, .enable_mtp = true});
+                     .hidden = 32, .output_rows = 128, .mask_words = 4, .draft_window = 5,
+                     .enable_mtp = true});
     const ninfer::TensorRegion exact_prefill =
         builder.add_tensor(ninfer::DType::BF16, {32, 16}, 256, "exact prefill hidden");
     q36::complete_round_state_layout(builder, round);
@@ -136,7 +138,8 @@ void test_round_layout() {
     q36::RoundStateLayout dflash = q36::begin_round_state_layout(
         speculative_builder,
         q36::RoundStateSpec{
-            .hidden = 32, .output_rows = 128, .draft_window = 15, .enable_dflash = true});
+            .hidden = 32, .output_rows = 128, .mask_words = 4, .draft_window = 15,
+            .enable_dflash = true});
     q36::complete_round_state_layout(speculative_builder, dflash);
     (void)speculative_builder.finish(256);
     expect(dflash.logits.shape[1] == 1 && dflash.dflash_prefill.has_value() &&
@@ -285,6 +288,51 @@ void test_prefix_identity() {
            "truncated multimodal continuation identity");
 }
 
+// The complete-history Volta long-attention profile admits only INT8 and FP8 KV for the SM70 27B
+// TP2/TP4 Text/None/MTP combination. Probe the factored-out admission predicate (zero GPU, no
+// device context) so the admit/reject contract stays locked: legal {int8, fp8} pass; {bf16,
+// nvfp4, k8v4} and the out-of-bounds {RAM-KV, DFlash} combinations are rejected.
+void test_volta_long_attention_admission() {
+    using KV   = ninfer::KvCacheStorage;
+    using Spec = ninfer::SpeculativeBackend;
+    const int sm    = 70;
+    const int heads = 24; // the 27B target's query-head count
+
+    auto base = []() {
+        ninfer::EngineOptions o;
+        o.volta_long_attention = true;
+        o.tp                   = 2;
+        o.pp                   = 1;
+        o.speculative.backend  = Spec::Mtp;
+        o.ram_kv.gpu_tokens    = 0;
+        return o;
+    };
+
+    // Legal: INT8 and FP8 are both admitted.
+    auto int8 = base(); int8.kv_cache = KV::Int8Group64;
+    expect(ninfer::engine_options_admit_volta_long_attention(sm, heads, int8), "INT8 long attention admitted");
+    auto fp8 = base(); fp8.kv_cache = KV::Fp8E4M3Group64;
+    expect(ninfer::engine_options_admit_volta_long_attention(sm, heads, fp8), "FP8 long attention admitted");
+
+    // Rejected: the other KV formats are not admitted for the long-attention profile.
+    auto bf16 = base(); bf16.kv_cache = KV::BFloat16;
+    expect(!ninfer::engine_options_admit_volta_long_attention(sm, heads, bf16), "BF16 long attention rejected");
+    auto nvfp4 = base(); nvfp4.kv_cache = KV::Nvfp4Group16;
+    expect(!ninfer::engine_options_admit_volta_long_attention(sm, heads, nvfp4), "NVFP4 long attention rejected");
+    auto k8v4 = base(); k8v4.kv_cache = KV::Fp8KeyNvfp4Value;
+    expect(!ninfer::engine_options_admit_volta_long_attention(sm, heads, k8v4), "K8V4 long attention rejected");
+
+    // Out-of-bounds: RAM KV and DFlash are never admitted, even with INT8.
+    auto ram_kv = base(); ram_kv.kv_cache = KV::Int8Group64; ram_kv.ram_kv.gpu_tokens = 8192;
+    expect(!ninfer::engine_options_admit_volta_long_attention(sm, heads, ram_kv), "RAM-KV long attention rejected");
+    auto dflash = base(); dflash.kv_cache = KV::Int8Group64; dflash.speculative.backend = Spec::DFlash;
+    expect(!ninfer::engine_options_admit_volta_long_attention(sm, heads, dflash), "DFlash long attention rejected");
+
+    // The flag is opt-in: with volta_long_attention unset the predicate always admits.
+    auto off = base(); off.volta_long_attention = false; off.kv_cache = KV::BFloat16;
+    expect(ninfer::engine_options_admit_volta_long_attention(sm, heads, off), "flag off always admitted");
+}
+
 } // namespace
 
 int main() {
@@ -294,6 +342,7 @@ int main() {
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();
+    test_volta_long_attention_admission();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

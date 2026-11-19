@@ -33,6 +33,21 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8KeyNvfp4Value, // key plane uses FP8 E4M3, value plane uses NVFP4 group-16
 };
 
+// Single source of truth for the human-readable name of each KV storage format. Both the CLI
+// (apps/cli/main.cpp) and the serve request log (src/serve/request_log.cpp) report through this
+// so the two can never drift apart -- in particular the request log must name the format that is
+// actually in use, not fold every non-BF16 format to "int8-group64".
+[[nodiscard]] inline const char* kv_cache_storage_name(KvCacheStorage storage) noexcept {
+    switch (storage) {
+    case KvCacheStorage::BFloat16: return "bf16";
+    case KvCacheStorage::Int8Group64: return "int8-group64";
+    case KvCacheStorage::Fp8E4M3Group64: return "fp8-e4m3-group64";
+    case KvCacheStorage::Nvfp4Group16: return "nvfp4-group16";
+    case KvCacheStorage::Fp8KeyNvfp4Value: return "fp8-key-nvfp4-value (k8v4)";
+    }
+    return "unknown";
+}
+
 enum class KvCapacityMode : std::uint8_t {
     Explicit,
     Automatic,
@@ -163,6 +178,22 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;
 };
+
+// Admission predicate for the experimental complete-history "Volta long attention" profile,
+// factored out of the target's validate_target_options so the admit/reject contract can be probed
+// without a live device. `sm` is the device compute capability (major*10+minor) and `query_heads`
+// the target's total query-head count; both are passed in so the predicate stays variant-agnostic
+// and zero-GPU testable. Returns true when the combination is admitted (the target throws only
+// when this returns false while volta_long_attention is set).
+[[nodiscard]] inline bool engine_options_admit_volta_long_attention(int sm, int query_heads,
+                                                                    const EngineOptions& o) noexcept {
+    return !(o.volta_long_attention &&
+             (query_heads != 24 || sm != 70 || (o.tp != 2 && o.tp != 4) || o.pp != 1 ||
+              !(o.kv_cache == KvCacheStorage::Int8Group64 ||
+                o.kv_cache == KvCacheStorage::Fp8E4M3Group64) ||
+              o.ram_kv.gpu_tokens != 0 ||
+              o.speculative.backend == SpeculativeBackend::DFlash));
+}
 
 enum class SamplingMode : std::uint8_t {
     Thinking,

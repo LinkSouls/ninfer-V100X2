@@ -403,7 +403,8 @@ int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
 // retaining a short prompt. The attention Op suite supplies the FP64 oracle;
 // this gate protects graph replay, MTP commits and exact saved frontiers.
 int exercise_long_attention(const char* artifact, ninfer::SpeculativeOptions profile,
-                            bool fast_decode) {
+                            bool fast_decode,
+                            ninfer::KvCacheStorage storage = ninfer::KvCacheStorage::Int8Group64) {
     require(profile.backend == ninfer::SpeculativeBackend::Mtp && v100x2_test::pp() == 1,
             "long attention state gate requires Text/MTP without pipeline parallelism");
     std::array<ninfer::GenerationResult, 3> captured;
@@ -411,6 +412,7 @@ int exercise_long_attention(const char* artifact, ninfer::SpeculativeOptions pro
     Tokens input;
     for (const bool graphs : {true, false}) {
         auto options = engine_options(artifact, true, graphs, profile);
+        options.kv_cache = storage;
         options.max_context = 90000;
         options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(90000);
         options.prefill_chunk = 2560;
@@ -486,6 +488,7 @@ int exercise_long_attention(const char* artifact, ninfer::SpeculativeOptions pro
         v100x2_test::check_peer_egress(engine, profile.backend);
     }
     std::cout << "85K long attention" << (fast_decode ? " + fast decode" : "")
+              << (storage == ninfer::KvCacheStorage::Fp8E4M3Group64 ? " [FP8 KV]" : " [INT8 KV]")
               << " MTP graph/eager, exact replay logits/counters and committed frontier PASS"
               << std::endl;
     return 0;
@@ -496,8 +499,9 @@ int exercise_long_attention(const char* artifact, ninfer::SpeculativeOptions pro
 int main(int argc, char** argv) {
     const bool long_attention = argc == 2 && std::string(argv[1]) == "--long-attention";
     const bool long_fast = argc == 2 && std::string(argv[1]) == "--long-fast-decode";
+    const bool long_fp8 = argc == 2 && std::string(argv[1]) == "--long-attention-fp8";
     const bool batches = argc == 2 && std::string(argv[1]) == "--mtp-batches";
-    if (argc != 1 && !long_attention && !long_fast && !batches) { return 2; }
+    if (argc != 1 && !long_attention && !long_fast && !long_fp8 && !batches) { return 2; }
     const char* artifact = std::getenv("NINFER_V100X2_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "skip: NINFER_V100X2_ARTIFACT is not set\n";
@@ -528,8 +532,11 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
-        return long_attention || long_fast
-            ? exercise_long_attention(artifact, profile, long_fast) : exercise(artifact, profile);
+        return long_attention || long_fast || long_fp8
+            ? exercise_long_attention(artifact, profile, long_fast,
+                                      long_fp8 ? ninfer::KvCacheStorage::Fp8E4M3Group64
+                                               : ninfer::KvCacheStorage::Int8Group64)
+            : exercise(artifact, profile);
     } catch (const std::exception& error) {
         std::cerr << "V100X2 integration: " << error.what() << '\n';
         return 1;

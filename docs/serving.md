@@ -793,7 +793,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage; the quantized values store D256-rotated rows with per-group scales (`fp8` FP8 E4M3 group-64, `nvfp4` 4-bit E2M1 group-16, `k8v4` asymmetric FP8 key / NVFP4 value) | `bf16` |
 | `--prefix-cache-tokens N` | historical host KV budget in unique page-rounded Main Text tokens; `0` disables historical branches, preserving current GPU-prefix reuse | `384000` |
-| `--volta-long-attention` | startup-fixed experimental complete-history attention; SM70 27B TP2/TP4, PP1, experimental concurrency 1–8, INT8 KV, Text/None/MTP (Vision on TP2 only); excludes RAM-KV; floating-point association and output IDs may change | off |
+| `--volta-long-attention` | startup-fixed experimental complete-history attention; SM70 27B TP2/TP4, PP1, experimental concurrency 1–8, INT8 or FP8 KV, Text/None/MTP (Vision on TP2 only); excludes RAM-KV; NVFP4/K8V4 long attention is a separate follow-up; floating-point association and output IDs may change | off |
 | `--volta-fast-decode` | experimental QUASAR SM70 TP2/TP4 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |

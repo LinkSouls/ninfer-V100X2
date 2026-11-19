@@ -65,25 +65,36 @@ std::int32_t gqa_small_t_split_upper_bound(std::int32_t window) {
     return (splits < Geometry::DecodeSplits) ? splits : Geometry::DecodeSplits;
 }
 
+// The Volta tensor-core small-T decode is instantiated with Int8=true for every quantized KV code
+// dtype (INT8 / FP8 / NVFP4, and K8V4 whose key code is FP8). The device-side
+// gqa_small_t_active_splits applies the long-window, short-range, and batch split policy keyed on
+// that Int8 template flag, NOT on a specific DType. The host-side planning below must mirror the
+// same set of dtypes, or the partial workspace it allocates diverges from the number of splits the
+// kernel actually writes (over-provisioning on the long-window path). BF16 uses the non-Int8 path
+// and is intentionally excluded.
+inline bool gqa_kv_code_is_quantized(DType dtype) {
+    return dtype == DType::I8 || dtype == DType::FP8_E4M3FN || dtype == DType::U8;
+}
+
 template <typename Geometry>
 std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, DType kv_dtype,
                                     bool volta_long_attention) {
-    if (kv_dtype == DType::I8) {
+    if (gqa_kv_code_is_quantized(kv_dtype)) {
         const int long_splits = gqa_volta_long_i8_splits<Geometry>(window, tokens, volta_long_attention);
         if (long_splits > 0) { return long_splits; }
     }
     // A 64-key default split just above a 32-key boundary makes the partial
     // kernel execute a nearly empty second tile. These short ranges instead
     // launch one 32-key tile per split; the larger CTAs keep the small grid busy.
-    if (kv_dtype == DType::I8 && tokens == 5 && window > 128 && window <= 512) {
+    if (gqa_kv_code_is_quantized(kv_dtype) && tokens == 5 && window > 128 && window <= 512) {
         return div_up(window, 32 / Geometry::DecodeSplitScale);
     }
-    if (kv_dtype == DType::I8 && tokens == 6 && window > 128 && window <= 160) {
+    if (gqa_kv_code_is_quantized(kv_dtype) && tokens == 6 && window > 128 && window <= 160) {
         return div_up(window, 24 / Geometry::DecodeSplitScale);
     }
     // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
     // one 170-SM wave after accounting for the geometry's KV-head count.
-    if (kv_dtype == DType::I8 && tokens == 6 && window > 5000 && window <= 8198) {
+    if (gqa_kv_code_is_quantized(kv_dtype) && tokens == 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::DecodeSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::DecodeSplitScale;
         constexpr std::int32_t kMax = 42 * Geometry::DecodeSplitScale;
@@ -101,7 +112,7 @@ std::int32_t gqa_small_t_launch_capacity(GqaExecutionEnvelope envelope, std::int
         if (window < envelope.min_visible_keys || window > envelope.max_visible_keys) { return; }
         auto splits = gqa_small_t_split_count<Geometry>(
             static_cast<std::int32_t>(window), tokens, dtype, envelope.volta_long_attention);
-        if (dtype == DType::I8) {
+        if (gqa_kv_code_is_quantized(dtype)) {
             splits = gqa_volta_batch_i8_splits<Geometry>(splits, window, tokens, batch_size);
         }
         capacity = capacity > splits ? capacity : splits;

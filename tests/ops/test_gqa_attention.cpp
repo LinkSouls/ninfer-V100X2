@@ -615,6 +615,19 @@ int run_quantized_split_policy_cases() {
         // TP2 MTP4 verifier: fragmented pages, an incomplete final key tile and
         // enough tiles per split to exercise the packed-KV lookahead repeatedly.
         {5, 85000, 85005, 607u},
+        // 16390 visible-key boundary for the remaining small-T decode widths (T=5 and T=6); the
+        // T=1 crossing is case 605 above. This is the FP32-accumulator specialization boundary
+        // (envelope.max_visible_keys <= 16390): just past it the decode falls back to the BF16
+        // accumulator, so the oracle must hold on both sides for every quantized code dtype.
+        {5, 16386, 16391, 611u},
+        {6, 16385, 16391, 612u},
+        // T in {1,5,6} just past the 65536 long-window boundary: the host plan must now use the
+        // same gqa_volta_long_i8_splits policy (1072 keys/split) as the device for every quantized
+        // code dtype, so the workspace high-water equals the planned capacity. Before the I8-only
+        // host gate these over-provisioned and the exact-equality high-water check failed.
+        {1, 65536, 65537, 608u},
+        {5, 65535, 65540, 609u},
+        {6, 65535, 65541, 610u},
     };
     int failures = 0;
     for (const DType dtype : {DType::I8, DType::FP8_E4M3FN, DType::U8}) {
