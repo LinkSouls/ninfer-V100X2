@@ -131,6 +131,8 @@ public:
 
     [[nodiscard]] ninfer::MemorySummary memory_summary() const;
 
+    [[nodiscard]] ninfer::DiskTierStats disk_tier_stats() const;
+
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const;
 
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const;

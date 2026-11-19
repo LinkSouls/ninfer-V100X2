@@ -233,6 +233,11 @@ MemorySummary Program<Variant>::memory_summary() const noexcept {
 }
 
 template <>
+DiskTierStats Program<Variant>::disk_tier_stats() const noexcept {
+    return impl_->disk_tier_stats();
+}
+
+template <>
 void Program<Variant>::reset_memory_peaks() noexcept {
     impl_->reset_memory_peaks();
 }

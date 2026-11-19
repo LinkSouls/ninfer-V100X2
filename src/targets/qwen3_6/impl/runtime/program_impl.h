@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "core/disk_kv_digest.h"
 
 #include "targets/qwen3_6/impl/runtime/bridge_dump.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
@@ -43,6 +44,15 @@ std::int32_t checked_i32(std::uint32_t value, const char* label) {
 // tensors; the grammar session covers only the token domain and OutputSession zero-fills the
 // extra padding words so constrained lanes forbid out-of-domain rows.
 constexpr std::size_t kPhysicalMaskWords = (TextConfig::output_rows + 31) / 32;
+
+// Archival chunk granularity: 64 pages = 4096 tokens, the bounded tail-recopy unit at a fork and
+// the demotion/restore unit of the disk tier.
+constexpr std::uint32_t kDiskKvChunkPages = 64;
+
+// Bounded FIFO depth of the async demotion queue. The plan thread is the only submitter, so a
+// "queue not full" check before submit is race-free with respect to growth (workers only shrink
+// it) and keeps demotion strictly non-blocking on the request path.
+constexpr std::size_t kDiskDemotionQueueCapacity = 64;
 
 std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
                                                  std::uint32_t token) {
@@ -305,6 +315,22 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::DFlashDecodeIngress) +
                                                              sizeof(qwen3_6::DFlashDecodeEgress))
                       : std::nullopt) {
+    // Program-level disk-tier content-identity class: a stable mix of the KV format, the TP*PP
+    // width, and the per-page payload size (which encodes the model+format+width layout). Two
+    // programs that differ in any of these produce distinct tags, so a reused disk directory can
+    // never alias a payload under the wrong class. The store also binds kv_format at open.
+    {
+        std::uint64_t mix = 0x9E3779B97F4A7C15ULL;
+        const auto feed = [&mix](std::uint64_t value) {
+            mix ^= value + 0x9E3779B97F4A7C15ULL + (mix << 6) + (mix >> 2);
+        };
+        feed(static_cast<std::uint64_t>(kv_storage));
+        feed(static_cast<std::uint64_t>(device_count));
+        feed(kv_payload_bytes);
+        feed(static_cast<std::uint64_t>(static_cast<std::uint32_t>(kv_quant_group)));
+        feed(static_cast<std::uint64_t>(kv_dtype));
+        disk_kv_tag = mix;
+    }
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
     }
@@ -535,6 +561,34 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
+    // Optional disk third tier (default off): one store under the plan's directory, bound to this
+    // program's KV storage format and slot geometry. A failed open (e.g. the directory is already
+    // bound to another KV format) runs the program without the tier; it never blocks startup.
+    if (plan.disk_kv_tier.enabled()) {
+        const auto pool_per_page = [](const auto& pool) {
+            std::size_t bytes = 0;
+            for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+                bytes += pool.plane(plane).bytes() / pool.page_group_count();
+            }
+            return bytes;
+        };
+        disk_kv_text_page_bytes  = pool_per_page(decoder->text_kv.pool());
+        const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+        disk_kv_backend_page_bytes = backend != nullptr ? pool_per_page(backend->pool()) : 0;
+        // One demotion chunk covers at most kDiskKvChunkPages pages (the archive granularity);
+        // the payload is the LE self-describing per-rank image (see serialize_disk_chunk_payload).
+        const std::size_t max_payload = 4 + std::size_t(device_count) *
+            (8 + std::size_t(kDiskKvChunkPages) *
+                 (disk_kv_text_page_bytes + disk_kv_backend_page_bytes));
+        const auto status = DiskKVStore::open(plan.disk_kv_tier.dir,
+                                              static_cast<std::uint32_t>(kv_storage), max_payload,
+                                              plan.disk_kv_tier.capacity_bytes, disk_kv_store);
+        if (status.ok) {
+            // Two writer threads keep demotion I/O off the plan/serve path; the bounded queue
+            // simply backlogs (the branch stays host-resident) when the disk falls behind.
+            disk_demotion_pool = std::make_unique<HostWorkerPool>(2, kDiskDemotionQueueCapacity);
+        }
+    }
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
@@ -667,7 +721,31 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         archive_prefix(sequence);
     }
     if (request_plan.archived_prefix) {
-        restore_archived_prefix(sequence, *request_plan.archived_prefix, request_plan);
+        std::vector<DiskChunkImage> disk_images;
+        if (load_disk_restore_images(*request_plan.archived_prefix, request_plan.reuse_base,
+                                     disk_images)) {
+            restore_archived_prefix(sequence, *request_plan.archived_prefix, request_plan,
+                                    &disk_images);
+        } else {
+            // 3.4: a demoted chunk was unavailable (missing, torn, CRC/identity mismatch, or the
+            // demotion write not yet complete). Fall back to a full recompute so the request
+            // still completes; the store dropped only the failed slot, every other disk identity
+            // stays intact and restorable.
+            ++disk_kv_restore_failures;
+            request_plan.archived_prefix.reset();
+            request_plan.reuse      = ReusePath::FullReset;
+            request_plan.reuse_base = 0;
+            request_plan.mtp_bridge = MtpBridgeMode::None;
+            request_plan.prepare_mtp = speculative_backend_ == SpeculativeBackend::Mtp;
+            if (prompt.identity.rewrite_checkpoint) {
+                request_plan.rewrite_checkpoint_action  = RewriteCheckpointAction::CaptureNew;
+                request_plan.rewrite_checkpoint_capture = *prompt.identity.rewrite_checkpoint;
+            } else {
+                request_plan.rewrite_checkpoint_action = RewriteCheckpointAction::Drop;
+                request_plan.rewrite_checkpoint_capture.reset();
+            }
+            request_plan.summary.reusable_prompt_tokens = 0;
+        }
     }
     if (request_plan.reuse != ReusePath::FullReset &&
         (!sequence.retained ||
@@ -1335,13 +1413,70 @@ std::uint64_t prefix_chunk_bytes(const PrefixKVChunk& chunk) noexcept {
     for (const auto& plane : chunk.backend) { bytes += plane.size(); }
     return bytes;
 }
+
+// Disk-tier chunk payload: a little-endian self-describing image of the chunk's per-rank
+// text/backend vectors (the first `device_count` ranks only):
+//   u32 rank_count | per rank: u32 text_len | text | u32 backend_len | backend
+// The exact shape restore imports per rank through import_page_prefix.
+std::vector<std::byte> serialize_disk_chunk_payload(const PrefixKVChunk& chunk,
+                                                   std::uint32_t device_count) {
+    const auto put_u32 = [](std::vector<std::byte>& out, std::uint32_t value) {
+        out.push_back(std::byte{static_cast<std::uint8_t>(value)});
+        out.push_back(std::byte{static_cast<std::uint8_t>(value >> 8)});
+        out.push_back(std::byte{static_cast<std::uint8_t>(value >> 16)});
+        out.push_back(std::byte{static_cast<std::uint8_t>(value >> 24)});
+    };
+    std::vector<std::byte> out;
+    put_u32(out, device_count);
+    for (std::uint32_t rank = 0; rank < device_count; ++rank) {
+        put_u32(out, static_cast<std::uint32_t>(chunk.text[rank].size()));
+        out.insert(out.end(), chunk.text[rank].begin(), chunk.text[rank].end());
+        put_u32(out, static_cast<std::uint32_t>(chunk.backend[rank].size()));
+        out.insert(out.end(), chunk.backend[rank].begin(), chunk.backend[rank].end());
+    }
+    return out;
+}
+
+bool deserialize_disk_chunk_payload(std::span<const std::byte> payload, std::uint32_t device_count,
+                                    DiskChunkImage& out) {
+    const auto get_u32 = [](std::span<const std::byte> in, std::size_t& offset,
+                            std::uint32_t& value) {
+        if (offset + 4 > in.size()) { return false; }
+        value = static_cast<std::uint32_t>(in[offset]) |
+                static_cast<std::uint32_t>(in[offset + 1]) << 8 |
+                static_cast<std::uint32_t>(in[offset + 2]) << 16 |
+                static_cast<std::uint32_t>(in[offset + 3]) << 24;
+        offset += 4;
+        return true;
+    };
+    std::size_t offset = 0;
+    std::uint32_t rank_count = 0;
+    if (!get_u32(payload, offset, rank_count) || rank_count != device_count) { return false; }
+    out = DiskChunkImage{};
+    for (std::uint32_t rank = 0; rank < device_count; ++rank) {
+        std::uint32_t length = 0;
+        if (!get_u32(payload, offset, length) || offset + length > payload.size()) { return false; }
+        const auto text_span = payload.subspan(offset, length);
+        out.text[rank].assign(text_span.begin(), text_span.end());
+        offset += length;
+        if (!get_u32(payload, offset, length) || offset + length > payload.size()) { return false; }
+        const auto backend_span = payload.subspan(offset, length);
+        out.backend[rank].assign(backend_span.begin(), backend_span.end());
+        offset += length;
+    }
+    return offset == payload.size();
+}
 }
 
 void ProgramImplCore::trim_prefix_history() {
+    reap_disk_demotions();
     // One reference-counting traversal yields both the budget's unique-chunk accounting and each
     // branch's exclusive bytes: a chunk shared with any other archived branch is not exclusive,
     // because removing this branch alone would not release it. Lane references are deliberately
     // excluded -- dropping a branch clears every lane's branch references as well.
+    // Disk-tier accounting: a demoted chunk (host bytes already released, payload on disk) and a
+    // chunk in an in-flight demotion (bytes released on write completion) cost the host budget
+    // nothing; the tier is what relieves the pressure, so counting them would defeat the trim.
     const auto usage = [&] {
         std::unordered_map<const PrefixKVChunk*, std::uint32_t> chunk_refs;
         std::unordered_map<const std::byte*, std::uint32_t> image_refs;
@@ -1349,18 +1484,33 @@ void ProgramImplCore::trim_prefix_history() {
             for (const auto& chunk : branch->chunks) { ++chunk_refs[chunk.get()]; }
             for (const auto& checkpoint : branch->checkpoints) { ++image_refs[checkpoint.image.get()]; }
         }
+        const auto in_flight = [&] {
+            std::lock_guard lock(disk_demotion_mutex);
+            return std::unordered_set<const ArchivedPrefix*>(disk_demotion_inflight.begin(),
+                                                             disk_demotion_inflight.end());
+        }();
+        std::unordered_set<const PrefixKVChunk*> in_flight_chunks;
+        for (const auto& branch : prefix_history) {
+            if (!in_flight.contains(branch.get())) { continue; }
+            for (const auto& chunk : branch->chunks) { in_flight_chunks.insert(chunk.get()); }
+        }
         std::uint64_t tokens = 0;
         for (const auto& entry : chunk_refs) {
-            tokens += std::uint64_t(entry.first->pages) * kPagedKVPageSize;
+            const auto* chunk = entry.first;
+            if (chunk->demoted.load(std::memory_order_relaxed)) { continue; }
+            if (in_flight_chunks.contains(chunk)) { continue; }
+            tokens += std::uint64_t(chunk->pages) * kPagedKVPageSize;
         }
         const std::uint64_t state_bytes = std::uint64_t(image_refs.size()) * prefix_checkpoint_bytes();
         std::vector<std::uint64_t> exclusive(prefix_history.size(), 0);
         for (std::size_t index = 0; index < prefix_history.size(); ++index) {
+            if (in_flight.contains(prefix_history[index].get())) { continue; }
             for (const auto& chunk : prefix_history[index]->chunks) {
+                if (chunk->demoted.load(std::memory_order_relaxed)) { continue; }
                 if (chunk_refs[chunk.get()] == 1) { exclusive[index] += prefix_chunk_bytes(*chunk); }
             }
         }
-        return std::tuple{tokens, state_bytes, std::move(exclusive)};
+        return std::tuple{tokens, state_bytes, std::move(exclusive), std::move(chunk_refs)};
     };
     // LRU victim order: branches whose removal releases exclusive memory come first, then the
     // least recently used, then the larger exclusive footprint. Recency is the primary key -- the
@@ -1374,16 +1524,21 @@ void ProgramImplCore::trim_prefix_history() {
         return exclusive[left] > exclusive[right];
     };
     while (!prefix_history.empty()) {
-        auto [tokens, state_bytes, exclusive] = usage();
+        auto [tokens, state_bytes, exclusive, chunk_refs] = usage();
         if (tokens <= prefix_cache_tokens && state_bytes <= kPrefixCheckpointBudget) { break; }
         if (tokens <= prefix_cache_tokens) {
-            // Keep branch endpoints; interior frontiers are expendable under state pressure.
-            // LRU drops the interior checkpoint of the least recently used branch that has one.
-            // Branches without interior checkpoints are skipped, never dropped wholesale at this
-            // step.
+            // Keep branch endpoints AND the largest interior (grid) checkpoint; the remaining
+            // interior frontiers are expendable under state pressure. LRU drops interior
+            // checkpoints of the least recently used branch. An extension hit (archived content
+            // plus a new suffix) can only match a frontier at or below the archived prompt
+            // boundary, which is always an interior frontier -- the endpoints lie past it, on the
+            // generated-token path (and the tokenizer's boundary behavior at the prompt's last
+            // token can break even the prompt-boundary match). Dropping the last interior
+            // checkpoint would make the branch unmatchable for that pattern (and, once demoted
+            // to the disk tier, unrestoreable), forcing a full recompute.
             std::size_t donor = prefix_history.size();
             for (std::size_t index = 0; index < prefix_history.size(); ++index) {
-                if (prefix_history[index]->checkpoints.size() <= 1) { continue; }
+                if (prefix_history[index]->checkpoints.size() <= 3) { continue; }
                 if (donor == prefix_history.size() ||
                     prefix_history[index]->last_used_tick <
                         prefix_history[donor]->last_used_tick) {
@@ -1399,12 +1554,164 @@ void ProgramImplCore::trim_prefix_history() {
         for (std::size_t index = 1; index < prefix_history.size(); ++index) {
             if (eviction_rank(index, victim, exclusive)) { victim = index; }
         }
+        auto& branch = *prefix_history[victim];
+        {
+            std::lock_guard lock(disk_demotion_mutex);
+            if (disk_kv_store != nullptr &&
+                (disk_demotion_inflight.contains(&branch) || disk_demotion_failed.contains(&branch))) {
+                // In flight: the host bytes release on write completion; a persistent write
+                // failure: the branch stays host-resident and the overrun is tolerated. Either way
+                // dropping it now would strand state, so stop trimming for this round.
+                break;
+            }
+        }
+        if (disk_kv_store != nullptr) {
+            // 3.1/3.2: demote the victim's exclusive, not-yet-demotion chunks to the disk tier.
+            // The write is async (the plan/serve path never blocks on disk I/O); the branch stays
+            // in history, matchable, and its host bytes release on write success.
+            std::vector<std::shared_ptr<const PrefixKVChunk>> to_demote;
+            for (const auto& chunk : branch.chunks) {
+                if (chunk->demoted.load(std::memory_order_relaxed)) { continue; }
+                if (chunk_refs[chunk.get()] == 1) { to_demote.push_back(chunk); }
+            }
+            if (!to_demote.empty()) {
+                submit_disk_demotion(branch, to_demote);
+                continue;
+            }
+        }
+        const auto* victim_branch = &branch;
         prefix_history.erase(prefix_history.begin() + static_cast<std::ptrdiff_t>(victim));
+        {
+            // The sets key on the canonical branch pointer; clear this branch's marks so a later
+            // allocation reusing the address cannot inherit a stale failure mark.
+            std::lock_guard lock(disk_demotion_mutex);
+            disk_demotion_failed.erase(victim_branch);
+            disk_demotion_inflight.erase(victim_branch);
+        }
         for (auto& sequence : sequences) {
             sequence.prefix_chunks.clear();
             sequence.shared_prefix_tokens = 0;
         }
     }
+}
+
+// Farthest recoverable page-tail frontier for one archived branch against the disk tier. Chunks
+// are contiguous from page 0 in `first_page` order, so the recoverable frontier is the page-tail
+// of the last consecutive recoverable chunk. A chunk is recoverable while it is still host
+// resident (not demoted -- the disk write is in flight or failed, the host bytes remain) and,
+// once demoted, while its identity is present in the store. A null store (disk tier off) or a
+// branch whose first recoverable chunk is absent recovers nothing and records a match miss.
+std::uint32_t ProgramImplCore::disk_recoverable_frontier(const ArchivedPrefix& archive,
+                                                          const DiskKVStore* store) {
+    if (store == nullptr) { return 0; }
+    std::uint32_t frontier = 0;
+    for (const auto& chunk : archive.chunks) {
+        if (chunk->first_page != frontier) { break; }
+        if (chunk->demoted.load(std::memory_order_relaxed) &&
+            !store->contains(chunk->disk_identity)) {
+            break;
+        }
+        frontier = chunk->first_page + chunk->pages;
+    }
+    if (frontier == 0) { ++disk_kv_match_misses; }
+    return frontier;
+}
+
+// 3.1/3.2: enqueues the branch's exclusive chunks for asynchronous demotion. The branch is marked
+// in-flight (under the mutex) so the trim loop counts its chunks as host-free and does not
+// re-submit it; the worker performs every write, releases the host bytes only when ALL writes
+// succeeded (marking each chunk demoted), and clears the in-flight mark on completion. A failed
+// write leaves the chunks host-resident: the next trim round picks a fresh victim.
+void ProgramImplCore::submit_disk_demotion(ArchivedPrefix& branch,
+                                           std::span<const std::shared_ptr<const PrefixKVChunk>> chunks) {
+    if (disk_demotion_pool == nullptr) { return; }
+    // Non-blocking guarantee (3.2): the plan thread is the only submitter and workers only shrink
+    // the queue, so observing room here means the enqueue below cannot block. When the queue is
+    // full (the disk is far behind), the branch stays host-resident and a later trim retries.
+    if (disk_demotion_pool->snapshot().queued >= kDiskDemotionQueueCapacity) { return; }
+    std::vector<std::shared_ptr<const PrefixKVChunk>> owned(chunks.begin(), chunks.end());
+    {
+        std::lock_guard lock(disk_demotion_mutex);
+        if (disk_demotion_inflight.contains(&branch)) { return; }
+        disk_demotion_inflight.insert(&branch);
+    }
+    auto future = disk_demotion_pool->submit(
+        [store = disk_kv_store.get(),
+         archive = std::make_shared<ArchivedPrefix>(branch), // strong ref: the branch is not
+                                                             // dropped while in flight
+         key = &branch, // canonical pointer: the in-flight/failed sets key on the history branch
+         chunks = std::move(owned), device_count = device_count, self = this] {
+            bool ok = true;
+            for (const auto& chunk : chunks) {
+                if (chunk->demoted.load(std::memory_order_relaxed)) { continue; }
+                const auto payload = serialize_disk_chunk_payload(*chunk, device_count);
+                if (store->write(chunk->disk_identity, payload)) { continue; }
+                ok = false;
+                break;
+            }
+            if (ok) {
+                // Release the host bytes under the demotion mutex: a restore guards the chunks it
+                // is importing in disk_restore_inflight (under the same mutex), so a chunk can
+                // never be emptied out from under an in-flight restore. A restoring chunk keeps
+                // its host bytes and is re-demoted by a later trim round (the write is idempotent).
+                std::lock_guard lock(self->disk_demotion_mutex);
+                for (const auto& chunk : chunks) {
+                    if (chunk->demoted.load(std::memory_order_relaxed)) { continue; }
+                    if (self->disk_restore_inflight.contains(chunk.get())) { continue; }
+                    for (auto& plane : chunk->text) { std::vector<std::byte>().swap(plane); }
+                    for (auto& plane : chunk->backend) { std::vector<std::byte>().swap(plane); }
+                    chunk->demoted.store(true, std::memory_order_relaxed);
+                }
+                self->disk_demotion_inflight.erase(key);
+            } else {
+                std::lock_guard lock(self->disk_demotion_mutex);
+                self->disk_demotion_inflight.erase(key);
+                self->disk_demotion_failed.insert(key);
+            }
+        });
+    std::lock_guard lock(disk_demotion_mutex);
+    pending_disk_demotions.push_back(std::move(future));
+}
+
+// Collects completed demotion futures so the pending vector stays bounded; the in-flight set is
+// cleared by the worker itself under the same mutex.
+void ProgramImplCore::reap_disk_demotions() {
+    std::lock_guard lock(disk_demotion_mutex);
+    for (auto it = pending_disk_demotions.begin(); it != pending_disk_demotions.end();) {
+        if (it->wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            it = pending_disk_demotions.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// 3.3/3.4: reads every demoted chunk of `archive` covered by `base` pages back from the disk
+// store. `out` aligns with archive.chunks (host-resident chunks get an empty image). Returns
+// false when any read fails (missing identity, torn slot, CRC or identity mismatch); the store
+// drops only the failed slot, every other disk identity stays intact, and the caller falls back
+// to a full recompute.
+bool ProgramImplCore::load_disk_restore_images(const ArchivedPrefix& archive, std::uint32_t base,
+                                               std::vector<DiskChunkImage>& out) {
+    out.assign(archive.chunks.size(), DiskChunkImage{});
+    if (disk_kv_store == nullptr) { return true; }
+    const auto pages = prefix_page_count(base);
+    for (std::size_t index = 0; index < archive.chunks.size(); ++index) {
+        const auto& chunk = archive.chunks[index];
+        if (chunk->first_page >= pages) { break; }
+        if (!chunk->demoted.load(std::memory_order_relaxed)) { continue; }
+        // The disk payload is the FULL chunk (demotion granularity); the restore import below
+        // slices the covered page prefix out of it, exactly as it does for host images.
+        const std::size_t expected = 4 + std::size_t(device_count) *
+            (8 + std::size_t(chunk->pages) * disk_kv_text_page_bytes +
+             std::size_t(chunk->backend_pages) * disk_kv_backend_page_bytes);
+        std::vector<std::byte> buffer(expected);
+        if (!disk_kv_store->read(chunk->disk_identity, buffer)) {
+            return false;
+        }
+        if (!deserialize_disk_chunk_payload(buffer, device_count, out[index])) { return false; }
+    }
+    return true;
 }
 
 void ProgramImplCore::archive_prefix(SequenceState& sequence) {
@@ -1438,10 +1745,20 @@ void ProgramImplCore::archive_prefix(SequenceState& sequence) {
     archive->checkpoints = std::move(saved_checkpoints);
     std::sort(archive->checkpoints.begin(), archive->checkpoints.end(),
               [](const auto& a, const auto& b) { return a.frontier < b.frontier; });
-    constexpr std::uint32_t chunk_pages = 64; // 4096 tokens, bounded tail recopy at a fork.
+    constexpr std::uint32_t chunk_pages = kDiskKvChunkPages; // 4096 tokens, bounded tail recopy at a fork.
     const auto backend_pages = prefix_page_count(archive->mtp_valid);
+    // Rolling disk-tier content digest: a pure function of the licensed ledger prefix, advanced
+    // by exactly the tokens each chunk's page-tail newly covers. Inherited chunks already carry a
+    // valid identity (same prefix, computed when first archived), so the digest is still advanced
+    // for them to stay in sync with the fresh chunks that follow.
+    DiskKvPrefixDigest disk_digest;
+    std::size_t disk_absorbed = 0;
     for (std::uint32_t first = 0; first < pages; first += chunk_pages) {
         const std::uint32_t count = std::min(chunk_pages, pages - first);
+        const std::size_t tail_tokens = std::min<std::uint64_t>(
+            std::uint64_t(first + count) * kPagedKVPageSize, archive->ledger.size());
+        disk_digest.absorb(archive->ledger.data() + disk_absorbed, tail_tokens - disk_absorbed);
+        disk_absorbed = tail_tokens;
         const auto inherited = std::find_if(sequence.prefix_chunks.begin(), sequence.prefix_chunks.end(),
             [&](const auto& chunk) {
                 return chunk->first_page == first && chunk->pages == count &&
@@ -1455,6 +1772,8 @@ void ProgramImplCore::archive_prefix(SequenceState& sequence) {
         chunk->first_page = first;
         chunk->pages = count;
         chunk->backend_pages = first < backend_pages ? std::min(count, backend_pages - first) : 0;
+        chunk->disk_identity = DiskKVIdentity{disk_digest.lo(), disk_digest.hi(), disk_kv_tag,
+                                              first + count};
         const auto capture = [&](const PagedKVAllocation& text,
                                   const std::optional<PagedKVAllocation>& backend,
                                   DeviceContext& ctx, int rank) {
@@ -1485,7 +1804,8 @@ void ProgramImplCore::archive_prefix(SequenceState& sequence) {
 }
 
 void ProgramImplCore::restore_archived_prefix(SequenceState& sequence, const ArchivedPrefix& archive,
-                                               const RequestPlanImpl& plan) {
+                                               const RequestPlanImpl& plan,
+                                               const std::vector<DiskChunkImage>* disk_images) {
     const auto base = plan.reuse_base;
     sequence.kv.reset();
     reserve_sequence_kv(sequence, plan.text_kv_page_entitlement, plan.backend_kv_page_entitlement);
@@ -1493,8 +1813,44 @@ void ProgramImplCore::restore_archived_prefix(SequenceState& sequence, const Arc
     materialize_sequence_kv(sequence, base, mtp_base);
     const auto pages = prefix_page_count(base);
     const auto mtp_pages = prefix_page_count(mtp_base);
+    // Guard the chunks this restore imports: the demotion worker releases a chunk's host bytes
+    // only under disk_demotion_mutex and only for chunks NOT in disk_restore_inflight, so a
+    // host-resident chunk cannot be emptied out from under this import, and a chunk demoted
+    // before the guard (already loaded from disk) stays demoted for the whole import.
+    struct RestoreGuard {
+        std::mutex& mutex;
+        std::unordered_set<const PrefixKVChunk*>& set;
+        std::vector<const PrefixKVChunk*> chunks;
+        ~RestoreGuard() {
+            std::lock_guard lock(mutex);
+            for (const auto* chunk : chunks) { set.erase(chunk); }
+        }
+    };
+    RestoreGuard guard{disk_demotion_mutex, disk_restore_inflight, {}};
     for (const auto& chunk : archive.chunks) {
         if (chunk->first_page >= pages) { break; }
+        guard.chunks.push_back(chunk.get());
+    }
+    {
+        std::lock_guard lock(disk_demotion_mutex);
+        for (const auto* chunk : guard.chunks) { disk_restore_inflight.insert(chunk); }
+    }
+    std::size_t chunk_index = 0;
+    for (const auto& chunk : archive.chunks) {
+        if (chunk->first_page >= pages) { break; }
+        // A demoted chunk's host vectors are empty; its image was read back from the disk tier
+        // (load_disk_restore_images) and imports through the identical page-prefix path.
+        const std::array<std::vector<std::byte>, kMaximumExecutionDevices>* text_source =
+            &chunk->text;
+        const std::array<std::vector<std::byte>, kMaximumExecutionDevices>* backend_source =
+            &chunk->backend;
+        if (chunk->demoted.load(std::memory_order_relaxed)) {
+            if (disk_images == nullptr) {
+                throw std::logic_error("demoted archive chunk has no disk restore image");
+            }
+            text_source    = &(*disk_images)[chunk_index].text;
+            backend_source = &(*disk_images)[chunk_index].backend;
+        }
         // Chunk images are plane/head-major; a partial range must be sliced per plane
         // by the allocation transport rather than treating its byte image as a prefix.
         // Import complete chunks, including the private page tail, then trim logically.
@@ -1503,11 +1859,12 @@ void ProgramImplCore::restore_archived_prefix(SequenceState& sequence, const Arc
                                   DeviceContext& ctx, int rank) {
             const ScopedDevice scope(ctx.device);
             const auto count = std::min(chunk->pages, pages - chunk->first_page);
-            text.import_page_prefix(chunk->first_page, count, chunk->pages, chunk->text[rank], ctx.stream);
+            text.import_page_prefix(chunk->first_page, count, chunk->pages, (*text_source)[rank],
+                                   ctx.stream);
             if (backend && chunk->first_page < mtp_pages) {
                 const auto bcount = std::min(chunk->backend_pages, mtp_pages - chunk->first_page);
                 backend->import_page_prefix(chunk->first_page, bcount, chunk->backend_pages,
-                                             chunk->backend[rank], ctx.stream);
+                                             (*backend_source)[rank], ctx.stream);
             }
         };
         restore(sequence.kv->text, sequence.kv->backend, device, 0);
@@ -1515,6 +1872,7 @@ void ProgramImplCore::restore_archived_prefix(SequenceState& sequence, const Arc
             restore(*sequence.kv->text_peers[peer->rank - 1],
                     sequence.kv->backend_peers[peer->rank - 1], peer->device, peer->rank);
         }
+        ++chunk_index;
     }
     sequence.ledger = archive.ledger;
     sequence.prefix_identity = archive.identity;
@@ -3676,6 +4034,26 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
         }
     }
     out.gdn_state_bytes                = gdn_state_bytes;
+    return out;
+}
+
+DiskTierStats ProgramImplCore::disk_tier_stats() const noexcept {
+    DiskTierStats out;
+    if (disk_kv_store == nullptr) { return out; } // tier disabled: enabled stays false, counters 0
+    const auto s = disk_kv_store->stats();
+    out.enabled             = true;
+    out.capacity_bytes      = disk_kv_store->capacity_bytes();
+    out.used_bytes          = disk_kv_store->used_bytes();
+    out.active_pages        = disk_kv_store->active_pages();
+    out.writes              = s.writes;
+    out.write_failures      = s.write_failures;
+    out.reads               = s.reads;
+    out.read_failures       = s.read_failures;
+    out.crc_mismatches      = s.crc_mismatches;
+    out.identity_mismatches = s.identity_mismatches;
+    out.evictions           = s.evictions;
+    out.index_rebuilds      = s.index_rebuilds;
+    out.restore_fallbacks   = disk_kv_restore_failures;
     return out;
 }
 

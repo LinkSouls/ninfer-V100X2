@@ -56,6 +56,11 @@ struct ServeOptions {
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     RamKvOptions ram_kv;
     std::uint32_t prefix_cache_tokens = 384000;
+    // Optional disk third tier for host historical KV. `--disk-kv-dir <path>` together with a
+    // positive `--disk-kv-gib <n>` persists demoted branches under <path>, bounded by n GiB;
+    // the default (no directory) leaves the tier completely off (no files, no demotion).
+    std::string disk_kv_dir;
+    std::uint32_t disk_kv_capacity_gib = 0;
     bool volta_long_attention = false;
     bool volta_fast_decode = false;
     SpeculativeOptions speculative;

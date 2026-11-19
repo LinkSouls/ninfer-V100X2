@@ -829,6 +829,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->ram_kv              = inputs.ram_kv;
     impl->prefix_cache_tokens = inputs.prefix_cache_tokens;
     impl->volta_long_attention = inputs.volta_long_attention;
+    impl->disk_kv_tier         = inputs.disk_kv_tier;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->kv_storage          = inputs.kv_storage;
@@ -977,6 +978,13 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .ram_kv         = options.ram_kv,
         .prefix_cache_tokens = options.prefix_cache_tokens,
         .volta_long_attention = options.volta_long_attention,
+        // Disk third tier: enabled only when BOTH a directory and a positive GiB cap are given;
+        // the default (empty directory) leaves it completely off.
+        .disk_kv_tier = DiskKvTierConfig{
+            options.disk_kv_dir,
+            options.disk_kv_capacity_gib != 0
+                ? std::size_t(options.disk_kv_capacity_gib) << 30
+                : 0},
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = inputs.ram_kv.gpu_tokens != 0

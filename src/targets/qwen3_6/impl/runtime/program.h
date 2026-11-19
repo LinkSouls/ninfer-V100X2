@@ -4,9 +4,11 @@
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
+#include "core/host_worker_pool.h"
 #include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
+#include "core/disk_kv_store.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
@@ -20,9 +22,13 @@
 
 #include <cstdint>
 #include <array>
+#include <atomic>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
@@ -155,6 +161,24 @@ struct PrefixKVChunk {
     std::uint32_t first_page = 0;
     std::uint32_t backend_pages = 0;
     std::uint32_t pages = 0;
+    // Mutable only for the disk tier: chunks are shared through const handles, and the demotion
+    // worker releases the host payload (swap-with-empty) once the durable disk write succeeds.
+    // No other path mutates these vectors after archival.
+    mutable std::array<std::vector<std::byte>, kMaximumExecutionDevices> text;
+    mutable std::array<std::vector<std::byte>, kMaximumExecutionDevices> backend;
+    // Content identity for the optional disk tier: rolling (lo,hi) digest over the licensed
+    // ledger prefix up to this chunk's page-tail, the program tag, and the page-tail frontier
+    // (first_page + pages). Two chunks with equal identities carry equal payload bytes.
+    DiskKVIdentity disk_identity;
+    // Disk-tier demotion marker: set (by the demotion worker, through the const shared handle)
+    // once the chunk's payload is durably in the disk store and the host vectors above have been
+    // released. A demoted chunk is restored by reading its identity back from the store.
+    mutable std::atomic<bool> demoted = false;
+};
+
+// Decoded disk-tier image of one demoted chunk: the per-rank text/backend payload in exactly the
+// shape of PrefixKVChunk's host vectors, imported through the same import_page_prefix path.
+struct DiskChunkImage {
     std::array<std::vector<std::byte>, kMaximumExecutionDevices> text;
     std::array<std::vector<std::byte>, kMaximumExecutionDevices> backend;
 };
@@ -351,6 +375,7 @@ public:
     [[nodiscard]] SpeculativeBackend speculative_backend() const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    [[nodiscard]] DiskTierStats disk_tier_stats() const noexcept;
 
     void reset_memory_peaks() noexcept;
 
@@ -437,11 +462,85 @@ public:
     // at 0 and every refresh takes the next value.
     std::uint64_t prefix_history_tick = 0;
     // Refreshes the recency stamp of an archived branch itself (not of a plan snapshot copy).
-    void touch_archived_prefix(ArchivedPrefix& archive) { archive.last_used_tick = ++prefix_history_tick; }
+    void touch_archived_prefix(ArchivedPrefix& archive) {
+        archive.last_used_tick = ++prefix_history_tick;
+        // A host-tier hit on a branch that carries demoted chunks also refreshes those chunks'
+        // disk recency stamps, so the branch sits at the back of the LRU in BOTH tiers; a host
+        // hit must not leave the branch's disk pages as the next eviction victims.
+        if (disk_kv_store != nullptr) {
+            for (const auto& chunk : archive.chunks) {
+                if (chunk->demoted.load(std::memory_order_relaxed)) {
+                    disk_kv_store->touch(chunk->disk_identity);
+                }
+            }
+        }
+    }
     void archive_prefix(SequenceState& sequence);
     void restore_archived_prefix(SequenceState& sequence, const ArchivedPrefix& archive,
-                                 const RequestPlanImpl& plan);
+                                 const RequestPlanImpl& plan,
+                                 const std::vector<DiskChunkImage>* disk_images = nullptr);
     void trim_prefix_history();
+
+    // Optional disk tier. `disk_kv_tag` is the program-level content-identity class (model/format/
+    // width) folded into every archived chunk's disk identity; `disk_kv_match_misses` is the
+    // observable count of disk-tier prefix matches that found no recoverable frontier.
+    //
+    // Digest production/consumption coverage (all four archive paths):
+    //   PRODUCTION  archive_prefix() rolls the ledger digest and stamps chunk->disk_identity for
+    //               every chunk. A chunk carries every rank's payload (text[rank]/backend[rank])
+    //               under that ONE identity, so the history-branch and peer-lane archive paths are
+    //               both covered here; the ledger (and hence the digest) is rank-independent.
+    //   CONSUMPTION disk_recoverable_frontier() checks each chunk's identity against the store for
+    //               a prefix-reuse match; the restore path (restore_archived_prefix, disk tier)
+    //               reads a demoted chunk back by the same chunk->disk_identity.
+    std::uint64_t disk_kv_tag = 0;
+    std::uint64_t disk_kv_match_misses = 0;
+    // Farthest page-tail frontier (in pages) at which every chunk from the start of `archive` up
+    // to and including that frontier is present in `store` under the chunk's content identity. A
+    // null `store` (disk tier off) yields 0, and a requested match that recovers no chunk counts
+    // as a miss.
+    std::uint32_t disk_recoverable_frontier(const ArchivedPrefix& archive,
+                                             const DiskKVStore* store);
+    // Opened in the constructor from the plan's DiskKvTierConfig when enabled; null when the tier
+    // is off (the default) or the open failed. Bound to the KV storage format at open.
+    std::unique_ptr<DiskKVStore> disk_kv_store;
+    // Per-page payload bytes of the text and backend (MTP) pools, fixed at construction; they size
+    // the disk slots and the restore read buffers for a chunk's exact page count.
+    std::size_t disk_kv_text_page_bytes = 0;
+    std::size_t disk_kv_backend_page_bytes = 0;
+    // Bounded FIFO of asynchronous demotion writes. The pool is declared LAST so it is destroyed
+    // FIRST: its join drains in-flight tasks while the store and bookkeeping below are alive.
+    std::mutex disk_demotion_mutex;
+    // Branches whose demotion write is in flight, keyed by the canonical archive pointer in
+    // prefix_history. In-flight chunks stay host-resident (their bytes are released only on write
+    // success) and are excluded from further demotion until the write completes.
+    std::unordered_set<const ArchivedPrefix*> disk_demotion_inflight;
+    // Branches whose last demotion write FAILED (persistent I/O error or oversized payload). They
+    // stay host-resident and are excluded from victim selection, so a broken store cannot turn
+    // the trim loop into a hot resubmission cycle; the budget overrun is tolerated.
+    std::unordered_set<const ArchivedPrefix*> disk_demotion_failed;
+    // Chunks whose host vectors a restore is importing right now. The demotion worker releases a
+    // chunk's host bytes only under disk_demotion_mutex and only for chunks NOT in this set, so a
+    // host-resident chunk can never be emptied out from under an in-flight restore.
+    std::unordered_set<const PrefixKVChunk*> disk_restore_inflight;
+    std::vector<std::future<void>> pending_disk_demotions;
+    std::unique_ptr<HostWorkerPool> disk_demotion_pool;
+    // Observable count of restore attempts that fell back to full recompute because a demoted
+    // chunk was unavailable (missing, torn, CRC/identity mismatch, or write not yet complete).
+    std::uint64_t disk_kv_restore_failures = 0;
+    // Submits the branch's exclusive, not-yet-demotion chunks to the async writer. The branch is
+    // marked in-flight under disk_demotion_mutex; the worker releases its host bytes only after
+    // every chunk write succeeded.
+    void submit_disk_demotion(ArchivedPrefix& branch,
+                              std::span<const std::shared_ptr<const PrefixKVChunk>> chunks);
+    // Collects completed demotion futures (memory hygiene); the in-flight set is cleared by the
+    // worker itself under the same mutex.
+    void reap_disk_demotions();
+    // Reads every demoted chunk of `archive` covered by `base` pages back from the disk store into
+    // `out` (aligned with archive.chunks; host chunks get an empty image). Returns false when any
+    // read fails; the failed slot is dropped by the store while every other identity is kept.
+    bool load_disk_restore_images(const ArchivedPrefix& archive, std::uint32_t base,
+                                  std::vector<DiskChunkImage>& out);
 
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;

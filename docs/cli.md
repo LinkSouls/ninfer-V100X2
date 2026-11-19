@@ -194,6 +194,8 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--devices A,B` | exactly `tp * pp` distinct CUDA device indices; required for parallel execution | `--device` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage; the quantized values store D256-rotated rows with per-group scales (`fp8` FP8 E4M3 group-64, `nvfp4` 4-bit E2M1 group-16, `k8v4` asymmetric FP8 key / NVFP4 value) | `bf16` |
 | `--prefix-cache-tokens N` | historical host KV budget in unique page-rounded Main Text tokens; `0` disables historical branches, preserving current GPU-prefix reuse | `384000` |
+| `--disk-kv-dir DIR` | optional disk third tier for demoted historical KV branches under `DIR` (device → host → disk); off unless paired with a positive `--disk-kv-gib`; no files are created when off | unset |
+| `--disk-kv-gib N` | GiB capacity bound for the disk tier; with `--disk-kv-dir` enables NVMe persistence of branches demoted when the host budget is exhausted, with page-granular LRU and full-recompute fallback on read failure | `0` (off) |
 | `--volta-long-attention` | experimental complete-history attention arithmetic; SM70 27B TP2/TP4, PP1, 1–8 active requests, INT8 or FP8 KV, Text/None/MTP (Vision on TP2 only); excludes RAM-KV; NVFP4/K8V4 long attention is a separate follow-up; floating-point association and output IDs may change | off |
 | `--volta-fast-decode` | experimental QUASAR SM70 TP2/TP4 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |
 | `--spec mtp\|dflash` | speculative backend | off |

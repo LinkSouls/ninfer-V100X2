@@ -157,6 +157,13 @@ struct EngineOptions {
     // More rounds favor active streams at the cost of the prefilling request's TTFT.
     std::uint32_t prefill_decode_rounds = 1;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // Optional disk third tier for host historical KV. When `disk_kv_dir` is non-empty AND
+    // `disk_kv_capacity_gib` is > 0, branches demoted from the host prefix budget are persisted
+    // under that directory, bounded by the GiB cap, and restorable to private GPU pages. The
+    // default (empty directory) leaves the tier completely off: no files are created and no
+    // demotion occurs.
+    std::filesystem::path disk_kv_dir;
+    std::uint32_t disk_kv_capacity_gib = 0;
     // Complete-history SM70 TP2/TP4 long attention with coarser KV partitions and FP32 PV.
     // Numerically qualified, not output-bit-equivalent to the default profile.
     bool volta_long_attention          = false;
@@ -646,6 +653,27 @@ struct MemorySummary {
     std::uint64_t ram_kv_transfer_bytes = 0; // Actual H2D+D2H payload, summed across ranks.
     // GDN (linear-attention) recurrent + convolution state for THIS device, head-sharded by tp.
     std::size_t gdn_state_bytes = 0;
+};
+
+// Observed state of the optional disk KV third tier. `enabled` is false when the tier is off (no
+// store opened) and every counter is zero in that case. Occupancy is the store's current footprint;
+// the event counters are monotonic for the open store's lifetime.
+struct DiskTierStats {
+    bool enabled          = false;
+    std::size_t capacity_bytes = 0;
+    std::size_t used_bytes     = 0;
+    std::size_t active_pages   = 0;
+    std::uint64_t writes               = 0;
+    std::uint64_t write_failures       = 0;
+    std::uint64_t reads                = 0;
+    std::uint64_t read_failures        = 0;
+    std::uint64_t crc_mismatches       = 0;
+    std::uint64_t identity_mismatches  = 0;
+    std::uint64_t evictions            = 0;
+    std::uint64_t index_rebuilds       = 0;
+    // Restore attempts that fell back to a full recompute because a demoted chunk was unavailable
+    // (missing, torn, CRC/identity mismatch, or the demotion write not yet complete).
+    std::uint64_t restore_fallbacks    = 0;
 };
 
 // One row of the per-device memory table. At tp * pp == 1 only `devices[0]` is

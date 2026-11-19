@@ -270,6 +270,8 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.ram_kv                   = options_.ram_kv;
     engine_options.prefix_cache_tokens      = options_.prefix_cache_tokens;
+    engine_options.disk_kv_dir              = options_.disk_kv_dir;
+    engine_options.disk_kv_capacity_gib     = options_.disk_kv_capacity_gib;
     engine_options.volta_long_attention     = options_.volta_long_attention;
     engine_options.volta_fast_decode     = options_.volta_fast_decode;
     engine_options.enable_vision            = options_.enable_vision;
@@ -353,6 +355,13 @@ ninfer::RuntimeStats GenerationService::runtime_stats() const {
 ninfer::MemorySummary GenerationService::memory_summary() const {
     std::lock_guard lock(request_capacity_->mutex);
     return residency_.state == "gpu" ? engine_->memory_summary() : ninfer::MemorySummary{};
+}
+
+ninfer::DiskTierStats GenerationService::disk_tier_stats() const {
+    std::lock_guard lock(request_capacity_->mutex);
+    // The disk store is owned by the GPU engine; it is destroyed on offload-to-RAM, so report a
+    // disabled tier in the "ram" state (matching memory_summary()).
+    return residency_.state == "gpu" ? engine_->disk_tier_stats() : ninfer::DiskTierStats{};
 }
 
 ninfer::MediaCacheSummary GenerationService::media_cache_summary() const {

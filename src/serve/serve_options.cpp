@@ -157,6 +157,8 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --prefix-cache-tokens N: historical host KV budget, default 384000; 0 disables history.\n"
+           "       --disk-kv-dir DIR --disk-kv-gib N: optional disk third tier for demoted historical\n"
+           "       KV branches under DIR, bounded by N GiB (default off: no files, no demotion).\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default).\n"
            "       --no-process-hardening keeps stderr blocking and skips post-warmup anonymous-page\n"
            "       locking; both are enabled by default and degrade individually with a logged\n"
@@ -249,6 +251,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefix-cache-tokens") {
             options.prefix_cache_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefix-cache-tokens"), "prefix-cache-tokens"));
+        } else if (arg == "--disk-kv-dir") {
+            options.disk_kv_dir = require_value("--disk-kv-dir");
+        } else if (arg == "--disk-kv-gib") {
+            options.disk_kv_capacity_gib = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--disk-kv-gib"), "disk-kv-gib"));
         } else if (arg == "--volta-fast-decode") {
             options.volta_fast_decode = true;
         } else if (arg == "--volta-long-attention") {

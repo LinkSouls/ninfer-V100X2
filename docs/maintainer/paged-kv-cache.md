@@ -1647,3 +1647,74 @@ GDN continuation checkpoint；近似模式复用已有近似状态，不保证�
 资格检查包括 exact code/scale eviction/reload、FP64 Q/K mean/cosine and selected-key attention oracle、原始因果位置与
 future-column masking、真实 Engine Text/MTP/prefix。长测结果按实际占用、窗口、committed decode、
 prefill、缓存命中、质量和整进程内存分别报告；外部 llama.cpp 结果不是原生实现的速度证据。
+
+## 21. 可选磁盘第三层：历史 KV 降级与恢复
+
+历史 KV 的默认两级是 **device**（GPU 独占 page）与 **host**（`--prefix-cache-tokens` 预算下的归档分枝，
+见 §10.4）。`EngineOptions.disk_kv_dir` 非空且 `disk_kv_capacity_gib>0` 时启用**磁盘第三层**，
+构成 device → host → disk 的三级层次，默认关闭：目录为空或容量为 0 时不创建任何文件、不发生任何
+降级，行为与关闭前逐字节一致。启用后，当 host 预算耗尽、`trim_prefix_history()` 选中让位分枝时，
+不再直接丢弃，而是把该分枝的独占、尚未降级的 chunk 异步写入 NVMe 存储；写入成功后释放其 host 字节
+并记录磁盘身份，分枝仍留在历史集合中、可被再次匹配，从而避免第二轮请求的完整重算。
+
+### 21.1 降级粒度与内容身份
+
+降级粒度为 `kDiskKvChunkPages`（64 页 = 4096 token），即归档时的 chunk 边界。每个 chunk 的内容身份为
+`DiskKVIdentity{lo, hi, tag, frontier}`：`lo`/`hi` 是沿 ledger 前缀滚动的 128 位 FNV 双摘要
+（`DiskKvPrefixDigest`，纯前缀函数、可分块推进），`tag` 是 program 级格式/宽度类标识，`frontier` 是
+chunk 页尾位置。同一身份携带同一 payload 字节，因此槽位仅凭内容身份即可寻址，索引丢失可扫描槽位头
+重建。摘要链的产生点（历史分枝归档、同伴 lane 归档）与消费点（前缀复用匹配、恢复）覆盖全部路径
+（§2 覆盖清单）；匹配侧对已降级分枝用 `disk_recoverable_frontier` 截断可恢复边界，匹配失败有
+`disk_kv_match_misses` 可观测计数。
+
+### 21.2 磁盘格式与 KV 格式绑定
+
+存储自包含（无 CUDA、无引擎类型），由 `src/core/disk_kv_store.{h,cpp}` 实现，可秒级独立编译与单元测试。
+数据文件为 4 KiB 对齐的定长槽位，每个槽位带 48 字节自描述头（magic、内容身份四字段、payload CRC32C、
+最近使用戳、payload 长度）；索引文件把身份映射到槽位，通过 tmp+rename 原子替换，读方只会看到完整旧版
+或完整新版索引，绝不看到半写。存储在打开时记录其 KV 存储格式标识（引擎传入 `KvCacheStorage` 原始值）；
+与当前引擎格式不一致时在打开时拒绝使用该存储文件并给出明确原因（format mismatch），绝不复用异格式存储。
+淘汰是 page 粒度 LRU，按最近使用戳经有序索引 O(log n) 定位最旧未保护槽位。
+
+### 21.3 恢复语义
+
+命中一个携带已降级 chunk 的归档分枝时，`disk_recoverable_frontier` 给出该分枝可恢复的最远页尾边界
+（chunk 自页 0 连续、且每个已降级 chunk 仍在存储中）；plan 侧只选 `checkpoint_pages` 不超过该边界的
+前缀检查点。恢复时 `load_disk_restore_images` 按需从磁盘读回每个已降级 chunk 的完整 payload，
+`restore_archived_prefix` 复用既有的页前缀导入路径把这些 chunk 导入请求的独占 GPU page——host 常驻
+chunk 与磁盘 chunk 走同一导入路径，磁盘 chunk 仅替换数据来源。恢复后的 KV 与降级前一致。
+
+扩展命中（归档内容 + 新后缀）只能匹配不超过归档 prompt 边界的前缀检查点，即分枝的内层检查点——
+端点检查点位于其后、落在生成 token 路径上，永不匹配。因此 state 压力 trim（§19）丢弃内层检查点时
+每个分枝保留最大的一个内层检查点：丢光内层检查点会使分枝对该命中模式不可匹配（降级后亦不可恢复），
+退化为完整重算，磁盘层即失去价值。
+
+### 21.4 失败回退
+
+页缺失、槽位撕裂、CRC 失配或身份不符时，存储只丢弃该失败槽位、保留其余全部磁盘身份；
+`load_disk_restore_images` 返回 false，请求回退到完整重算（`ReusePath::FullReset`）并照常完成——
+绝不因单页故障删除其他磁盘身份，也绝不失败请求。降级写入仍在途的 chunk 视为不可用（`demoted` 未置位），
+匹配侧按 `disk_recoverable_frontier` 自然截断，同样回退重算。写入持久失败的分枝留在 host
+（`disk_demotion_failed` 标记避免热重提交循环），容忍预算越界，后续 trim 再择新 victim。
+
+### 21.5 异步与不阻塞保证
+
+降级通过 `HostWorkerPool`（2 写线程、有界 FIFO 队列，容量 `kDiskDemotionQueueCapacity`）异步执行；
+plan/serve 路径从不阻塞在磁盘 I/O 上。plan 线程是唯一提交者、工作线程只会缩小队列，因此提交前
+`queued >= 容量` 的预检即可证明入队不阻塞；队列满时该分枝保持 host 常驻、稍后重试。
+
+### 21.6 选项与可观测性
+
+CLI/serve 提供 `--disk-kv-dir DIR` 与 `--disk-kv-gib N`（默认关闭）。启动 JSON 记录
+`disk_kv_dir`/`disk_kv_capacity_gib`/`disk_kv_enabled`。运行时查询接口 `Engine::disk_tier_stats()`
+返回占用（capacity/used/active pages）与累计事件计数（写/读/失败/CRC/身份/淘汰/索引重建/恢复回退）。
+host 层命中事件同时推进磁盘层最近使用戳（`touch_archived_prefix` 对每个已降级 chunk 调
+`store->touch`），使同一分枝在两级都处于靠后的淘汰位置。
+
+### 21.7 资格与边界
+
+磁盘层只对 Text/None/MTP 的历史分枝生效（与 §10.4 一致）；Vision、DFlash、稀疏 RAM-KV 不进入该层。
+磁盘层是 host 预算的补充而非替代：host 预算（`--prefix-cache-tokens`）先耗尽才触发降级，磁盘容量
+（`--disk-kv-gib`）独立封顶、写满后经 LRU 淘汰最旧未保护槽位。端到端恢复须与完整重算对照测量首 token
+延迟；恢复失败回退、进程重启索引重建、写满容量 LRU 边界的行为由 `src/core/disk_kv_store.{h,cpp}` 的
+独立单元测试覆盖，整模型 A/B 与重启测量在具备 GPU 与 `.ninfer` 产物的环境完成。

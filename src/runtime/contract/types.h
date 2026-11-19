@@ -54,6 +54,13 @@ struct RequestPlanSummary {
     FinishReason effective_limit_reason   = FinishReason::None;
     std::size_t transient_bytes           = 0;
     std::size_t transient_alignment       = 1;
+    // A disk-restore plan whose demoted chunks may fail to load falls back to a full recompute at
+    // execution time (the 3.4 fallback). That turns a plan that projected no (or a small) prefill
+    // into a full, possibly multi-step, prefill. The executor must therefore reserve prefill
+    // execution resources (retain the prefill lane and activate the transient region) for such a
+    // plan, even when reusable_prompt_tokens == prompt_tokens, or an incomplete fallback prefill
+    // would violate the "partial prefill retains its execution owner" invariant.
+    bool may_degrade_to_full_prefill      = false;
     AdmissionResources admission;
     std::uint64_t service_work_quanta = 0;
 };

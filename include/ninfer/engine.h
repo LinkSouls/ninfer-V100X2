@@ -115,6 +115,7 @@ public:
     [[nodiscard]] ModelMemory retain_model_in_memory(const LoadProgress& progress = {}) const;
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;
+    [[nodiscard]] DiskTierStats disk_tier_stats() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     void reset_memory_peaks() noexcept;

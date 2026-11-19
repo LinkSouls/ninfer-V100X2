@@ -640,6 +640,16 @@ ninfer_add_test(ninfer_grammar_test
   SOURCES test_grammar.cpp
   LIBRARIES ninfer_grammar)
 
+# The disk KV store is self-contained (no CUDA, no engine types); this test compiles the module
+# source directly and links no library, which proves that property.
+add_executable(ninfer_disk_kv_store_test
+  test_disk_kv_store.cpp
+  ${PROJECT_SOURCE_DIR}/src/core/disk_kv_store.cpp)
+target_include_directories(ninfer_disk_kv_store_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME ninfer_disk_kv_store_test COMMAND ninfer_disk_kv_store_test)
+
 # Apply after all registrations, including aliases with their own ENVIRONMENT property.
 # CUDA performs physical-to-logical ordinal mapping for every test and its child processes.
 # An empty cache value leaves a caller-provided CUDA_VISIBLE_DEVICES unchanged.

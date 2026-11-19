@@ -216,6 +216,11 @@ public:
         return out;
     }
 
+    [[nodiscard]] DiskTierStats disk_tier_stats() const {
+        std::scoped_lock lock(execution_mutex_);
+        return instance_.program->disk_tier_stats();
+    }
+
     [[nodiscard]] RuntimeStats runtime_stats() const {
         std::lock_guard lock(stats_mutex_);
         return published_stats_;
@@ -890,7 +895,13 @@ private:
         }
         clear_protection_if_head(request);
 
-        const bool needs_prefill = summary.reusable_prompt_tokens < summary.prompt_tokens;
+        // A disk-restore plan may fall back to a full (multi-step) prefill at execution time (the
+        // 3.4 fallback on a demoted-chunk read failure), so it must reserve prefill resources even
+        // when it projects no suffix; otherwise an incomplete fallback prefill would lose its
+        // execution owner. The service-work projection already treats such a plan as a full prefill.
+        const bool needs_prefill =
+            summary.reusable_prompt_tokens < summary.prompt_tokens ||
+            summary.may_degrade_to_full_prefill;
         bool target_started      = false;
         try {
             request->budget.emplace(summary.effective_output_tokens,

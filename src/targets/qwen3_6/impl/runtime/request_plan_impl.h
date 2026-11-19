@@ -187,6 +187,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                                    const PreparedPromptData& prompt,
                                                    const RequestBasePlan& base_plan) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    reap_disk_demotions();
     const RequestControl& request = requests[lane];
     const SequenceState& sequence = sequences[lane];
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
@@ -252,8 +253,21 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             }
         }
         for (const auto& archive : prefix_history) {
+            // Disk tier: a branch carrying demoted chunks is restorable only up to the frontier
+            // at which every chunk is present in the store; a checkpoint past that frontier would
+            // demand pages that are gone, so it is not a valid match target.
+            const bool has_demoted = std::any_of(archive->chunks.begin(), archive->chunks.end(),
+                [](const auto& chunk) { return chunk->demoted.load(std::memory_order_relaxed); });
+            const std::uint32_t recoverable_pages =
+                (disk_kv_store != nullptr && has_demoted)
+                    ? disk_recoverable_frontier(*archive, disk_kv_store.get())
+                    : std::numeric_limits<std::uint32_t>::max();
             for (const auto& checkpoint : archive->checkpoints) {
+                const std::uint32_t checkpoint_pages =
+                    checkpoint.frontier == 0 ? 0
+                                             : 1 + (checkpoint.frontier - 1) / kPagedKVPageSize;
                 if (checkpoint.frontier > plan->reuse_base &&
+                    checkpoint_pages <= recoverable_pages &&
                     qwen3_6::detail::prefix_matches(prompt, archive->ledger, archive->identity,
                                                    checkpoint.frontier)) {
                     plan->archived_prefix = std::make_shared<ArchivedPrefix>(*archive);
@@ -378,8 +392,22 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                  plan->rewrite_checkpoint_capture->frontier < plan->summary.prompt_tokens
              ? 1ULL
              : 0ULL);
+    // A disk-restorable checkpoint may fall back to a full recompute at execution time (a demoted
+    // chunk read can fail: missing, torn, CRC/identity mismatch, or the demotion write not yet
+    // complete). The service-work projection is fixed at plan time, so project the WORST case for
+    // such a plan (reuse_base = 0, i.e. a full prefill); a successful restore then simply does less
+    // work than projected. Host-resident restores cannot fail, so they keep the tight projection.
+    const bool disk_restore_planned = plan->archived_prefix != nullptr &&
+        std::any_of(plan->archived_prefix->chunks.begin(), plan->archived_prefix->chunks.end(),
+            [](const auto& chunk) { return chunk->demoted.load(std::memory_order_relaxed); });
+    const std::uint32_t projected_reuse_base =
+        disk_restore_planned ? 0 : plan->reuse_base;
     plan->summary.service_work_quanta =
-        projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
+        projected_service_work(plan->summary, projected_reuse_base, prefill_chunk, prefill_splits);
+    // The executor reserves prefill execution resources from this flag: a disk-restore plan may
+    // fall back to a full (multi-step) prefill, so it must retain the prefill lane even when it
+    // projects no suffix (reusable == prompt), matching the worst-case projection above.
+    plan->summary.may_degrade_to_full_prefill = disk_restore_planned;
     return RequestPlan(std::move(plan));
 }
 

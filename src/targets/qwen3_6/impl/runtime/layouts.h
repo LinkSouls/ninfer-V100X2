@@ -3,6 +3,7 @@
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
 #include "core/cyclic_kv_cache.h"
+#include "core/disk_kv_store.h"
 #include "core/dtype.h"
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
@@ -93,6 +94,7 @@ struct SequencePlanningInputs {
     RamKvOptions ram_kv;
     std::uint32_t prefix_cache_tokens = 384000;
     bool volta_long_attention = false;
+    DiskKvTierConfig disk_kv_tier; // optional disk third-tier for historical KV (off by default)
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -128,6 +130,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     RamKvOptions ram_kv;
     std::uint32_t prefix_cache_tokens = 384000;
     bool volta_long_attention = false;
+    DiskKvTierConfig disk_kv_tier; // optional disk third-tier for historical KV (off by default)
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t request_transient_capacity_bytes = 0;

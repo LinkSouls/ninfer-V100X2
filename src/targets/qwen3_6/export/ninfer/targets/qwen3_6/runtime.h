@@ -188,6 +188,7 @@ public:
     [[nodiscard]] SpeculativeBackend speculative_backend() const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    [[nodiscard]] DiskTierStats disk_tier_stats() const noexcept;
     void reset_memory_peaks() noexcept;
 
     // Debug-only, OFF by default: capture of the full-vocabulary logits behind the most recently
