@@ -37,7 +37,14 @@ struct ServeOptions {
     std::uint32_t max_pending_requests     = 16;
     std::uint32_t pending_timeout_ms       = 30000;
     std::uint32_t prefill_chunk            = 1024;
-    std::uint32_t prefill_decode_rounds    = 1;
+    // Sub-step bounding one prefill execution unit (128-aligned, in [128, prefill_chunk]).
+    // Unset by default: the step equals the prefill chunk (no split).
+    std::optional<std::uint32_t> prefill_step_tokens;
+    // Fixed decode-round compensation between prefill steps. Set only when
+    // --prefill-decode-rounds is passed explicitly; unset selects proportional
+    // compensation driven by prefill_decode_target_ms.
+    std::optional<std::uint32_t> prefill_decode_rounds;
+    std::uint32_t prefill_decode_target_ms = 100;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;

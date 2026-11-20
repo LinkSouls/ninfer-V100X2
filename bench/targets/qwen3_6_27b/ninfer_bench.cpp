@@ -171,6 +171,7 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(
             options.ram_kv.gpu_tokens != 0 ? options.ram_kv.gpu_tokens : max_context);
         engine_options.prefill_chunk = options.prefill_chunk;
+        engine_options.prefill_step_tokens = options.prefill_step_tokens;
         engine_options.kv_cache      = options.kv_cache;
         engine_options.speculative.backend       = options.speculative_backend;
         engine_options.speculative.draft_tokens  = options.mtp_draft_tokens;
@@ -184,6 +185,7 @@ int main(int argc, char** argv) {
         env.artifact_file_size_bytes = ninfer::bench::file_size_or_zero(options.artifact_path);
         env.max_context              = max_context;
         env.prefill_chunk            = options.prefill_chunk;
+        env.prefill_step_tokens      = options.prefill_step_tokens;
         env.pipeline_chunks         = options.pp == 2 ? options.pipeline_chunks : 1U;
         env.kv_cache                 = options.kv_cache;
         env.speculative_backend      = options.speculative_backend;

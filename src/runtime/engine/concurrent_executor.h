@@ -46,13 +46,30 @@ public:
         : instance_(instance), device_(device.device), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
-          prefill_decode_rounds_(options.prefill_decode_rounds),
+          prefill_decode_rounds_(options.prefill_decode_rounds.value_or(0)),
+          prefill_decode_target_ms_(options.prefill_decode_target_ms),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           admission_capacity_(instance.program->admission_capacity()) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
-            options.max_pending_requests == 0 || pending_timeout_.count() <= 0 ||
-            prefill_decode_rounds_ == 0 || prefill_decode_rounds_ > 64) {
+            options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
+        }
+        if (prefill_decode_rounds_ != 0 && prefill_decode_rounds_ > 64) {
+            throw std::invalid_argument(
+                "concurrent executor prefill decode rounds must be in [1,64]");
+        }
+        if (prefill_decode_rounds_ == 0 && prefill_decode_target_ms_ < 10) {
+            throw std::invalid_argument(
+                "concurrent executor prefill decode target must be at least 10 ms");
+        }
+        if (options.prefill_step_tokens.has_value()) {
+            const std::uint32_t prefill_step = *options.prefill_step_tokens;
+            if (prefill_step == 0 || prefill_step % 128 != 0 || prefill_step < 128 ||
+                prefill_step > options.prefill_chunk) {
+                throw std::invalid_argument(
+                    "concurrent executor prefill step tokens must be 128-aligned and within "
+                    "[128, prefill_chunk]");
+            }
         }
         if (admission_capacity_.active_lanes != max_concurrency_ ||
             admission_capacity_.main_kv_pages == 0) {
@@ -759,6 +776,22 @@ private:
         publish_runtime_stats();
     }
 
+    // Decode compensation owed after one prefill execution unit. Fixed mode pays the configured
+    // count; proportional mode pays one decode round per `prefill_decode_target_ms` of measured
+    // prefill wall clock (clamped to [1, 32]), so the compensation scales with the device speed
+    // instead of a hardware-specific constant.
+    void set_decode_compensation(Clock::duration prefill_wall) {
+        if (prefill_decode_rounds_ != 0) {
+            decode_compensation_target_ = prefill_decode_rounds_;
+            return;
+        }
+        const auto target = std::chrono::milliseconds(prefill_decode_target_ms_);
+        const auto ceil_units =
+            (prefill_wall.count() + target.count() - 1) / target.count();
+        decode_compensation_target_ =
+            static_cast<std::uint32_t>(std::clamp<std::int64_t>(ceil_units, 1, 32));
+    }
+
     [[nodiscard]] std::vector<std::shared_ptr<Request>> pending_snapshot() const {
         std::lock_guard lock(queue_mutex_);
         return {pending_.begin(), pending_.end()};
@@ -924,6 +957,7 @@ private:
             }
             publish_runtime_stats();
             target_started                = true;
+            const auto step_started        = Clock::now();
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient,
                 &request->output);
@@ -932,6 +966,7 @@ private:
             }
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             resolve_prefill_step(request, first, cancel_at_boundary);
+            set_decode_compensation(Clock::now() - step_started);
             publish_runtime_stats();
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
@@ -1285,12 +1320,14 @@ private:
 
                 if (prefill_lane_) {
                     if (!membership.empty() &&
-                        decode_rounds_since_prefill < prefill_decode_rounds_) {
+                        decode_rounds_since_prefill < decode_compensation_target_) {
                         run_decode_round(membership);
                         ++decode_rounds_since_prefill;
                         previous_unit_was_decode = true;
                     } else {
+                        const auto step_started = Clock::now();
                         run_prefill_step();
+                        set_decode_compensation(Clock::now() - step_started);
                         decode_rounds_since_prefill = 0;
                         previous_unit_was_decode = false;
                     }
@@ -1335,6 +1372,8 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::uint32_t prefill_decode_rounds_;
+    const std::uint32_t prefill_decode_target_ms_;
+    std::uint32_t decode_compensation_target_ = 0;
     const std::chrono::milliseconds pending_timeout_;
     const AdmissionResources admission_capacity_;
 

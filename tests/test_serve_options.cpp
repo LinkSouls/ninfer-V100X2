@@ -48,10 +48,12 @@ int main() {
                       "TP4 server lost the four-rank device order");
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
-    failures += check(defaults.prefill_decode_rounds == 1,
-                      "default prefill/decode alternation changed");
+    failures += check(!defaults.prefill_decode_rounds.has_value() &&
+                          defaults.prefill_decode_target_ms == 100 &&
+                          !defaults.prefill_step_tokens.has_value(),
+                      "default prefill/decode scheduling options changed");
     failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-decode-rounds", "4"})
-                          .prefill_decode_rounds == 4,
+                          .prefill_decode_rounds == 4U,
                       "configured decode burst was lost");
     for (const char* invalid : {"0", "65"}) {
         bool rejected = false;
@@ -60,6 +62,21 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "out-of-range decode burst was accepted");
     }
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-step-tokens", "512"})
+                          .prefill_step_tokens == std::make_optional(512U),
+                      "configured prefill sub-step was lost");
+    for (const char* invalid : {"0", "64", "300", "4096"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--prefill-step-tokens", invalid});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "out-of-range prefill sub-step was accepted");
+    }
+    bool small_target = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--prefill-decode-target-ms", "5"});
+    } catch (const std::invalid_argument&) { small_target = true; }
+    failures += check(small_target, "too-small decode target interval was accepted");
     failures += check(parse({"ninfer-serve", "model.ninfer", "--volta-long-attention"}).volta_long_attention &&
                           !defaults.volta_long_attention,
                       "server Volta long attention must be explicit and disabled by default");

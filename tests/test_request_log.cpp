@@ -54,7 +54,9 @@ int main() {
     options.yarn_origin                    = 262144;
     options.kv_capacity                    = ninfer::KvCapacityPolicy::explicit_capacity(524288);
     options.prefill_chunk                  = 1024;
+    options.prefill_step_tokens              = 256;
     options.prefill_decode_rounds          = 4;
+    options.prefill_decode_target_ms       = 100;
     options.log_stats_interval_ms          = 2500;
     options.kv_cache                       = ninfer::KvCacheStorage::Int8Group64;
     options.speculative.backend            = ninfer::SpeculativeBackend::Mtp;
@@ -181,6 +183,9 @@ int main() {
     failures += check(server.at("engine").at("kv_cache") == "int8-group64", "KV type missing");
     failures += check(server.at("engine").at("prefill_decode_rounds") == 4,
                       "decode burst configuration missing");
+    failures += check(server.at("engine").at("prefill_step_tokens") == 256 &&
+                          server.at("engine").at("prefill_decode_target_ms") == 100,
+                      "prefill sub-step / decode target configuration missing");
     failures += check(server.at("engine").at("vision") == false, "Vision state missing");
     failures += check(server.at("engine").at("speculative_backend") == "mtp",
                       "speculative backend missing");

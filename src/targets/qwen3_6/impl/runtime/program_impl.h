@@ -285,7 +285,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                           : std::nullopt),
       capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), prefix_cache_tokens(plan.prefix_cache_tokens),
-      prefill_chunk(plan.prefill_chunk),
+      prefill_chunk(plan.prefill_chunk), prefill_step(plan.prefill_step),
       draft_window(plan.draft_window), ram_kv(plan.ram_kv), volta_long_attention(plan.volta_long_attention),
       speculative_backend_(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
@@ -3091,7 +3091,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (staged.cursor >= sequence.ram_rank_frontier + 8192) {
                 refresh_ram_kv(sequence, staged.cursor);
             }
-            const auto end = std::min(staged.prompt_tokens, staged.cursor + prefill_chunk * pipeline_chunks);
+            const auto end = std::min(staged.prompt_tokens, staged.cursor + prefill_step * pipeline_chunks);
             const auto require = [&](PagedKVAllocation& a) {
                 a.require_pages(staged.cursor / 64, (end + 63) / 64);
             };
@@ -3169,7 +3169,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t quantum = prefill_chunk * pipeline_chunks;
+            const std::uint32_t quantum = prefill_step * pipeline_chunks;
             std::uint32_t nominal =
                 std::min(quantum, staged.prompt_tokens - staged.cursor);
             std::uint32_t early_frontier = 0;

@@ -304,6 +304,7 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
+        << "  --prefill-step-tokens <t>   prefill sub-step, 128-aligned within [128, prefill-chunk] (default: unset = no split)\n"
         << "  --kv-dtype <bf16|int8>      KV cache storage (default: bf16)\n"
         << "  --spec <none|mtp|dflash>    speculative backend (default: none)\n"
         << "  --draft-tokens <n>          speculative draft window\n"
@@ -367,6 +368,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.max_context = parse_u32(value("--max-ctx"), "max-ctx");
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
+        } else if (arg == "--prefill-step-tokens") {
+            options.prefill_step_tokens = parse_u32(value("--prefill-step-tokens"), "prefill-step-tokens");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
         } else if (arg == "--spec") {
@@ -458,6 +461,13 @@ BenchOptions parse_args(int argc, char** argv) {
     }
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
+    }
+    if (options.prefill_step_tokens.has_value()) {
+        const std::uint32_t prefill_step = *options.prefill_step_tokens;
+        if (prefill_step < 128 || prefill_step % 128 != 0 || prefill_step > options.prefill_chunk) {
+            throw std::invalid_argument(
+                "--prefill-step-tokens must be 128-aligned and within [128, prefill-chunk]");
+        }
     }
     if (options.speculative_backend == SpeculativeBackend::None &&
         options.mtp_draft_tokens != 0) {
@@ -837,6 +847,10 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"config\": {\n"
         << "    \"max_context\": " << env.max_context << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
+        << "    \"prefill_step_tokens\": "
+        << (env.prefill_step_tokens.has_value() ? std::to_string(*env.prefill_step_tokens)
+                                                : std::string("null"))
+        << ",\n"
         << "    \"volta_long_attention\": " << (env.volta_long_attention ? "true" : "false") << ",\n"
         << "    \"volta_fast_decode\": " << (env.volta_fast_decode ? "true" : "false") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"

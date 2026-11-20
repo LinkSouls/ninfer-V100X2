@@ -179,7 +179,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
              ? 1ULL
              : 0ULL);
     base->summary.service_work_quanta =
-        projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits);
+        projected_service_work(base->summary, 0, prefill_step, cold_prefill_splits);
     return RequestBasePlan(std::move(base));
 }
 
@@ -403,7 +403,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     const std::uint32_t projected_reuse_base =
         disk_restore_planned ? 0 : plan->reuse_base;
     plan->summary.service_work_quanta =
-        projected_service_work(plan->summary, projected_reuse_base, prefill_chunk, prefill_splits);
+        projected_service_work(plan->summary, projected_reuse_base, prefill_step, prefill_splits);
     // The executor reserves prefill execution resources from this flag: a disk-restore plan may
     // fall back to a full (multi-step) prefill, so it must retain the prefill lane even when it
     // projects no suffix (reusable == prompt), matching the worst-case projection above.

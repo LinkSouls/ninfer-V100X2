@@ -392,6 +392,8 @@ public:
     const std::uint32_t max_concurrency;
     const std::uint32_t prefix_cache_tokens;
     const std::uint32_t prefill_chunk;
+    // Effective prefill sub-step bounding one prefill execution unit (<= prefill_chunk).
+    const std::uint32_t prefill_step;
     const std::uint32_t draft_window;
     const RamKvOptions ram_kv;
     const bool volta_long_attention;

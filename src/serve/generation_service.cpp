@@ -266,7 +266,9 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
+    engine_options.prefill_step_tokens      = options_.prefill_step_tokens;
     engine_options.prefill_decode_rounds    = options_.prefill_decode_rounds;
+    engine_options.prefill_decode_target_ms = options_.prefill_decode_target_ms;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.ram_kv                   = options_.ram_kv;
     engine_options.prefix_cache_tokens      = options_.prefix_cache_tokens;

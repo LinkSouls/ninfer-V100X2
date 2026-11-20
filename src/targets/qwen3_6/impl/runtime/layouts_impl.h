@@ -813,6 +813,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
+    impl->prefill_step        = inputs.prefill_step;
     impl->draft_window        = inputs.draft_window;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
@@ -957,6 +958,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .vision_max_tokens   = std::min(options.max_context, options.vision_max_tokens),
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
+        .prefill_step        = std::min(std::min(options.prefill_chunk, options.max_context),
+                                        options.prefill_step_tokens.value_or(options.prefill_chunk)),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
         .kv_dtype       = kv_geom.k_code,

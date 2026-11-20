@@ -66,6 +66,10 @@ struct SequencePlanningInputs {
     std::uint32_t vision_max_tokens        = 0;
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
+    // Effective prefill sub-step: the configured prefill_step_tokens if set, else the
+    // prefill chunk (no split). One prefill execution unit advances the lane at most this
+    // many tokens.
+    std::uint32_t prefill_step             = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
@@ -110,6 +114,10 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t main_page_groups         = 0;
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
+    // Effective prefill sub-step: the configured prefill_step_tokens if set, else the
+    // prefill chunk (no split). One prefill execution unit advances the lane at most this
+    // many tokens.
+    std::uint32_t prefill_step             = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;

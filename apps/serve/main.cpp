@@ -5,6 +5,7 @@
 #include "serve/http_server.h"
 #include "serve/serve_options.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -85,6 +86,9 @@ int main(int argc, char** argv) {
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, loaded.str());
 
         const ninfer::MemorySummary memory = service.memory_summary();
+        const std::uint32_t effective_prefill_step = std::min(
+            {options.prefill_chunk, options.max_context,
+             options.prefill_step_tokens.value_or(options.prefill_chunk)});
         std::ostringstream capacity;
         capacity << "KV capacity "
                  << (memory.kv_capacity_mode == ninfer::KvCapacityMode::Automatic ? "auto"
@@ -92,6 +96,7 @@ int main(int argc, char** argv) {
                  << " resolved=" << memory.kv_capacity
                  << " tokens pages=" << memory.kv_capacity_page_groups << '/'
                  << memory.kv_capacity_max_page_groups
+                 << " prefill-step=" << effective_prefill_step
                  << " runtime=" << format_bytes(memory.runtime_reservation_bytes)
                  << " free-after-weights=" << format_bytes(memory.available_after_weights_bytes)
                  << " free-after-startup=" << format_bytes(memory.available_after_startup_bytes)

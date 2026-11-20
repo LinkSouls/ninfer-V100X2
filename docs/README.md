@@ -47,6 +47,13 @@ The executable `--help` output is the exact source for command-line option spell
 - [Maintainer tools](../tools/README.md)
 - [Capability evaluation](../eval/README.md)
 
+## Change verification paths
+
+Per-change evidence-ladder pages (static wiring, numeric invariance, behavioural A/B, interleaved
+end-to-end) with the commands, observations and cost at each layer:
+
+- [p11 prefill/decode interleave](changes/p11-prefill-decode-interleave.md)
+
 ## Maintainer references
 
 The active references under [`maintainer/`](maintainer/) record current architecture, model,

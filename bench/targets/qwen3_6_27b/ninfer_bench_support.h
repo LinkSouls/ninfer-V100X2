@@ -62,6 +62,7 @@ struct BenchOptions {
     int warmup      = kDefaultWarmup;
     std::optional<std::uint32_t> max_context;
     std::uint32_t prefill_chunk    = kDefaultPrefillChunk;
+    std::optional<std::uint32_t> prefill_step_tokens;
     KvCacheStorage kv_cache        = KvCacheStorage::BFloat16;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     std::uint32_t mtp_draft_tokens = 0;
@@ -125,6 +126,7 @@ struct BenchEnvironment {
 
     std::uint32_t max_context                      = 0;
     std::uint32_t prefill_chunk                    = kDefaultPrefillChunk;
+    std::optional<std::uint32_t> prefill_step_tokens;
     KvCacheStorage kv_cache                        = KvCacheStorage::BFloat16;
     SpeculativeBackend speculative_backend         = SpeculativeBackend::None;
     std::uint32_t mtp_draft_tokens                 = 0;

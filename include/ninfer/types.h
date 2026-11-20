@@ -153,9 +153,18 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
-    // Decode rounds between bounded prefill steps when both phases are runnable (1..64).
-    // More rounds favor active streams at the cost of the prefilling request's TTFT.
-    std::uint32_t prefill_decode_rounds = 1;
+    // Sub-step (tokens) bounding one prefill execution unit: 128-aligned and in
+    // [128, prefill_chunk]. A full chunk completes in successive sub-steps, which caps the
+    // per-unit wall clock so concurrent decode is not starved on slow devices. Unset by
+    // default: the step equals the prefill chunk (no split, the whole-chunk path).
+    std::optional<std::uint32_t> prefill_step_tokens;
+    // Fixed decode rounds between bounded prefill steps when both phases are runnable (1..64).
+    // Set to select fixed-count compensation; left unset to select proportional compensation,
+    // which runs one decode round per `prefill_decode_target_ms` of measured prefill wall clock.
+    std::optional<std::uint32_t> prefill_decode_rounds;
+    // Target interval in milliseconds (>= 10) between decode rounds while a request is
+    // prefilling, used when `prefill_decode_rounds` is unset.
+    std::uint32_t prefill_decode_target_ms = 100;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     // Optional disk third tier for host historical KV. When `disk_kv_dir` is non-empty AND
     // `disk_kv_capacity_gib` is > 0, branches demoted from the host prefix budget are persisted
