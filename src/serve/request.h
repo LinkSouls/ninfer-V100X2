@@ -231,4 +231,47 @@ struct GenerationRequest {
     }
 };
 
+// Fixed placeholders used when a media part is degraded because the server runs
+// without vision (see degrade_media_history). The text is a deterministic
+// contract: the same history degrades to the same text on every request.
+inline constexpr std::string_view kImageOmittedPlaceholder =
+    "[image omitted: vision is disabled on this server]";
+inline constexpr std::string_view kVideoOmittedPlaceholder =
+    "[video omitted: vision is disabled on this server]";
+
+// Rewrite the Image/Video parts of every turn EXCEPT the current turn (the last
+// user message) into a fixed placeholder Text part, and return the number of
+// parts rewritten. Media on the current turn is left untouched so the
+// vision_disabled 400 check still fires for an active vision request; media in
+// earlier turns is stale context and must not fail the session. A request with
+// no user turn has no current turn, so all of its media is degraded. The
+// rewritten part's media source is cleared with it: no acquisition follows.
+[[nodiscard]] inline std::size_t degrade_media_history(GenerationRequest& request) {
+    std::ptrdiff_t current_turn = -1;
+    for (std::ptrdiff_t i = static_cast<std::ptrdiff_t>(request.messages.size()) - 1;
+         i >= 0; --i) {
+        if (request.messages[i].role == ChatRole::User) {
+            current_turn = i;
+            break;
+        }
+    }
+    std::size_t degraded = 0;
+    for (std::size_t i = 0; i < request.messages.size(); ++i) {
+        if (static_cast<std::ptrdiff_t>(i) == current_turn) { continue; }
+        for (ContentPart& part : request.messages[i].content) {
+            if (part.kind == ContentKind::Image || part.kind == ContentKind::Video) {
+                const std::string_view placeholder =
+                    part.kind == ContentKind::Image ? kImageOmittedPlaceholder
+                                                    : kVideoOmittedPlaceholder;
+                ContentPart text;
+                text.kind = ContentKind::Text;
+                text.text = std::string(placeholder);
+                part = std::move(text);
+                ++degraded;
+            }
+        }
+    }
+    return degraded;
+}
+
 } // namespace ninfer::serve

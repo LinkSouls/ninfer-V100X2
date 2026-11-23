@@ -86,6 +86,10 @@ struct PreparedRequest {
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
+    // Media parts rewritten to placeholders because the server runs without
+    // vision (degrade_media_history). Zero unless the degradation fired; the
+    // request log records it only when non-zero.
+    std::size_t media_degraded_count = 0;
 };
 
 struct ModelResidency {

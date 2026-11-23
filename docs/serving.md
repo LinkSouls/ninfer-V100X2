@@ -80,9 +80,15 @@ When `--model-id` is omitted, the server advertises and accepts the loaded conta
 select or alter the artifact.
 
 Vision is disabled by default: its weights, Vision scratch phase, and frozen request-transient
-buffer are not allocated, and media
-requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
-server must accept image or video input. Speculative residency is likewise frozen by
+buffer are not allocated. When Vision is off, media blocks in the **current turn** (the last user
+message) of a media request or token-count request fail with HTTP 400 `vision_disabled`. Media
+blocks in **history turns** are degraded instead: each is rewritten to the fixed placeholder text
+`[image omitted: vision is disabled on this server]` (or the video equivalent), the turn structure
+is preserved, and the request proceeds; the number of rewritten blocks is recorded as
+`media_degraded_count` in the request log, and only when non-zero. This keeps a conversation that
+once carried an image usable on a text-only server. Add `--vision` when the server must accept
+image or video input; with Vision enabled no degradation happens. Speculative residency is
+likewise frozen by
 `--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash is text-only: 35B-A3B
 supports up to fifteen drafts and Qwen3.8-27B artifacts with the optional DFlash2 package support

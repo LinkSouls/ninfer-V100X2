@@ -186,6 +186,10 @@ Json request_json(const RequestLogContext& context) {
     if (context.tool_reference_count != 0) {
         request["tool_reference_count"] = context.tool_reference_count;
     }
+    // Same compact rule for media degraded to placeholders on a vision-less server.
+    if (context.media_degraded_count != 0) {
+        request["media_degraded_count"] = context.media_degraded_count;
+    }
     return request;
 }
 
@@ -317,6 +321,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();
     context.tool_reference_count               = request.tool_reference_count;
+    context.media_degraded_count               = prepared.media_degraded_count;
     context.enable_thinking                    = prepared.enable_thinking;
     context.preserve_thinking                  = prepared.preserve_thinking;
     context.preserve_thinking_semantic_change  = prepared.preserve_thinking_semantic_change;
@@ -361,6 +366,9 @@ std::string format_request_start(const RequestLogContext& context) {
         << " sampler=[" << sampler_str(context.sampling) << ']';
     if (context.tool_reference_count != 0) {
         out << " tool_reference=" << context.tool_reference_count;
+    }
+    if (context.media_degraded_count != 0) {
+        out << " media_degraded=" << context.media_degraded_count;
     }
     if (context.media_item_count != 0) {
         out << " prepare=" << seconds_str(context.preparation.seconds)

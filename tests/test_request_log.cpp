@@ -331,6 +331,21 @@ int main() {
                           std::string::npos,
                       "console request line did not report the degraded tool_reference count");
 
+    // A request without degraded media keeps the field out of the log entirely.
+    failures += check(!started.at("request").contains("media_degraded_count"),
+                      "media_degraded_count appeared for a request without degraded media");
+
+    PreparedRequest degraded_prepared;
+    degraded_prepared.media_degraded_count = 3;
+    const RequestLogContext degraded_context =
+        make_request_log_context(11, "anthropic_messages", request, degraded_prepared);
+    const Json degraded = Json::parse(format_request_start_json("serve-test", 2800, degraded_context));
+    failures += check(degraded.at("request").at("media_degraded_count") == 3,
+                      "media_degraded_count missing from the request log");
+    failures += check(format_request_start(degraded_context).find("media_degraded=3") !=
+                          std::string::npos,
+                      "console request line did not report the degraded media count");
+
     ApiError preparation_error;
     preparation_error.status = 400;
     preparation_error.type   = "invalid_request_error";

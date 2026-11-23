@@ -347,6 +347,9 @@ target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_media_degrade_test
+  SOURCES test_media_degrade.cpp
+  LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_http_error_handler_test
   SOURCES test_http_error_handler.cpp
   LIBRARIES ninfer_serve)

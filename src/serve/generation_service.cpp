@@ -466,7 +466,17 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     prepared.enable_thinking                   = semantics.enable_thinking;
     prepared.preserve_thinking                 = semantics.preserve_thinking;
     prepared.preserve_thinking_semantic_change = request.preserve_thinking_semantic_change;
-    const bool request_has_media               = request.media_item_count() != 0;
+    // Without vision, degrade media in history turns to placeholders so a single
+    // stale image cannot fail the whole session; media on the current turn (the
+    // last user message) is left in place and still hits the 400 below.
+    const GenerationRequest* effective_request = &request;
+    GenerationRequest degraded_request;
+    if (!options_.enable_vision) {
+        degraded_request             = request;
+        prepared.media_degraded_count = degrade_media_history(degraded_request);
+        effective_request            = &degraded_request;
+    }
+    const bool request_has_media = effective_request->media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
@@ -478,10 +488,11 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         std::size_t remaining_media_bytes =
             std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
         ninfer::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
-                return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
-                                     remaining_media_bytes);
-            });
+            to_prompt_input(*effective_request, semantics,
+                            [&](const ContentPart& part) {
+                                return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
+                                                     remaining_media_bytes);
+                            });
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
@@ -507,7 +518,16 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
 int GenerationService::count_prompt_tokens(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
     const auto lifetime = acquire_request_lifetime();
-    const bool request_has_media = request.media_item_count() != 0;
+    // Same history-media degradation as prepare(): the token count of a
+    // degraded request must match the generation path.
+    const GenerationRequest* effective_request = &request;
+    GenerationRequest degraded_request;
+    if (!options_.enable_vision) {
+        degraded_request  = request;
+        (void)degrade_media_history(degraded_request); // count is not logged on this path
+        effective_request = &degraded_request;
+    }
+    const bool request_has_media = effective_request->media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
@@ -515,14 +535,16 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     const Clock::time_point deadline =
         Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
     const ResolvedPromptSemantics semantics =
-        resolve_prompt_semantics(request, options_, prompt_capabilities_);
+        resolve_prompt_semantics(*effective_request, options_, prompt_capabilities_);
     try {
         std::size_t remaining_media_bytes =
             std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
         ninfer::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
-                return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
-            });
+            to_prompt_input(*effective_request, semantics,
+                            [&](const ContentPart& part) {
+                                return acquire_media(part, deadline, is_cancelled,
+                                                     remaining_media_bytes);
+                            });
         check_preparation_control(deadline, is_cancelled);
         const PreparationControl control{
             .deadline     = deadline,
