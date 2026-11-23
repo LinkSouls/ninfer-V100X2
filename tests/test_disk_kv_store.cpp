@@ -615,10 +615,88 @@ void test_digest() {
     CHECK(empty.hi() == 0x9dc8d177d94a1b9eULL);
 }
 
+// Cross-restart cold restore frontier (disk_kv_cold_recoverable_frontier in disk_kv_digest.h):
+// the re-derived chunk identity chain must match the archival path chunk for chunk, and the
+// recoverable frontier must stop at the first chunk absent from the store.
+void test_cold_recoverable_frontier() {
+    using ninfer::DiskKvPrefixDigest;
+    using ninfer::disk_kv_cold_recoverable_frontier;
+    constexpr std::uint32_t kPageSize   = 64; // kPagedKVPageSize
+    constexpr std::uint32_t kChunkPages = 64; // kDiskKvChunkPages
+    constexpr std::uint64_t kTag        = 7;
+
+    // A ledger of 8192 tokens (two 4096-token chunks).
+    const std::size_t n_full = 8192;
+    std::vector<std::int32_t> ledger(n_full);
+    for (std::size_t i = 0; i < n_full; ++i) { ledger[i] = static_cast<std::int32_t>(i * 7 + 3); }
+
+    // Reference: replicate the archival path's chunk identity chain (chunking + rolling digest).
+    const auto archive_identities = [&](std::size_t n) {
+        std::vector<DiskKVIdentity> ids;
+        const std::uint32_t pages = n == 0 ? 0 : 1 + (n - 1) / kPageSize;
+        DiskKvPrefixDigest digest;
+        std::size_t absorbed = 0;
+        for (std::uint32_t first = 0; first < pages; first += kChunkPages) {
+            const std::uint32_t count = std::min(kChunkPages, pages - first);
+            const std::size_t tail =
+                std::min<std::uint64_t>(std::uint64_t(first + count) * kPageSize, n);
+            digest.absorb(ledger.data() + absorbed, tail - absorbed);
+            absorbed = tail;
+            ids.push_back(DiskKVIdentity{digest.lo(), digest.hi(), kTag, first + count});
+        }
+        return ids;
+    };
+    // Cold re-derivation: collect the re-derived identities through a recording predicate.
+    const auto cold_identities = [&](std::size_t n) {
+        std::vector<DiskKVIdentity> ids;
+        disk_kv_cold_recoverable_frontier(ledger.data(), n, kTag, kPageSize, kChunkPages,
+            [&](const DiskKVIdentity& id) { ids.push_back(id); return true; });
+        return ids;
+    };
+
+    // (a) The archival and cold re-derivation paths yield identical chunk identity chains
+    // (lo, hi, tag, frontier) for the same ledger.
+    CHECK(archive_identities(n_full) == cold_identities(n_full));
+
+    const auto dir = test_dir("cold_frontier");
+    std::string error;
+    auto store = open_store(dir, 1, 64 * 1024, 4 * 1024 * 1024, error);
+    CHECK(store != nullptr);
+    if (store == nullptr) { std::cerr << "  open: " << error << std::endl; return; }
+    for (const auto& id : archive_identities(n_full)) {
+        CHECK(store->write(id, make_payload(id.lo, 1024)));
+    }
+    const auto contains = [s = store.get()](const DiskKVIdentity& id) { return s->contains(id); };
+
+    // (a/cont.) With every chunk resident, the frontier reaches the full ledger's page-tail.
+    CHECK(disk_kv_cold_recoverable_frontier(ledger.data(), n_full, kTag, kPageSize, kChunkPages,
+                                            contains) == 1 + (n_full - 1) / kPageSize);
+
+    // (b) A tag mismatch means no re-derived identity matches the store: the frontier is 0.
+    CHECK(disk_kv_cold_recoverable_frontier(ledger.data(), n_full, kTag + 1, kPageSize, kChunkPages,
+                                            contains) == 0);
+
+    // (c) A truncated ledger (a prefix) stops the frontier at the truncation's last full chunk:
+    // 5000 tokens = 79 pages, so the re-derived second chunk is partial (over 5000 tokens) and its
+    // identity differs from the archived one; the frontier stops at the first chunk's tail (64).
+    CHECK(disk_kv_cold_recoverable_frontier(ledger.data(), 5000, kTag, kPageSize, kChunkPages,
+                                            contains) == 64);
+
+    // (d) An empty store (no resident identities) yields a frontier of 0.
+    const auto empty_dir = test_dir("cold_frontier_empty");
+    auto empty_store = open_store(empty_dir, 1, 64 * 1024, 4 * 1024 * 1024, error);
+    CHECK(empty_store != nullptr);
+    if (empty_store == nullptr) { return; }
+    CHECK(disk_kv_cold_recoverable_frontier(
+              ledger.data(), n_full, kTag, kPageSize, kChunkPages,
+              [s = empty_store.get()](const DiskKVIdentity& id) { return s->contains(id); }) == 0);
+}
+
 } // namespace
 
 int main() {
     test_digest();
+    test_cold_recoverable_frontier();
     test_round_trip();
     test_crc_mismatch();
     test_identity_mismatch();

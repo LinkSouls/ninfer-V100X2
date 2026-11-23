@@ -49,6 +49,13 @@ constexpr std::size_t kPhysicalMaskWords = (TextConfig::output_rows + 31) / 32;
 // the demotion/restore unit of the disk tier.
 constexpr std::uint32_t kDiskKvChunkPages = 64;
 
+// XOR applied to the program-level KV content-identity class (disk_kv_tag) to derive the GDN
+// endpoint-state payload class. The GDN endpoint image (linear-attention recurrent state + tail
+// hidden) is a distinct payload written into the SAME content-addressed disk store; the distinct
+// tag keeps it from aliasing a KV chunk payload under the same (lo,hi,frontier) when a reused
+// directory outlives the process that wrote it.
+constexpr std::uint64_t kDiskKvGdnStateTagXor = 0x5A5A5A5A5A5A5A5AULL;
+
 // Bounded FIFO depth of the async demotion queue. The plan thread is the only submitter, so a
 // "queue not full" check before submit is race-free with respect to growth (workers only shrink
 // it) and keeps demotion strictly non-blocking on the request path.
@@ -330,6 +337,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
         feed(static_cast<std::uint64_t>(static_cast<std::uint32_t>(kv_quant_group)));
         feed(static_cast<std::uint64_t>(kv_dtype));
         disk_kv_tag = mix;
+        // Distinct payload class for the GDN endpoint state image (see kDiskKvGdnStateTagXor).
+        disk_kv_gdn_tag = mix ^ kDiskKvGdnStateTagXor;
     }
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
@@ -587,6 +596,16 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
             // Two writer threads keep demotion I/O off the plan/serve path; the bounded queue
             // simply backlogs (the branch stays host-resident) when the disk falls behind.
             disk_demotion_pool = std::make_unique<HostWorkerPool>(2, kDiskDemotionQueueCapacity);
+            // Separate content-addressed store for the GDN endpoint state images, under a
+            // subdirectory so the KV store's slot geometry is untouched (pre-existing KV
+            // directories stay openable). Slots are sized to the full endpoint image. A GDN-store
+            // open failure disables cold restore only (the KV tier and its in-memory restore are
+            // unaffected); the demotion worker skips the GDN write when the store is null.
+            const std::filesystem::path gdn_dir = plan.disk_kv_tier.dir / "gdn";
+            const auto gdn_status = DiskKVStore::open(gdn_dir, static_cast<std::uint32_t>(kv_storage),
+                                                      prefix_checkpoint_bytes(),
+                                                      plan.disk_kv_tier.capacity_bytes, disk_gdn_store);
+            (void)gdn_status; // best-effort: a failure here leaves disk_gdn_store null.
         }
     }
 }
@@ -724,8 +743,46 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         std::vector<DiskChunkImage> disk_images;
         if (load_disk_restore_images(*request_plan.archived_prefix, request_plan.reuse_base,
                                      disk_images)) {
-            restore_archived_prefix(sequence, *request_plan.archived_prefix, request_plan,
-                                    &disk_images);
+            const auto& spec = *request_plan.archived_prefix;
+            const auto spec_index = std::find_if(spec.checkpoints.begin(), spec.checkpoints.end(),
+                [base = request_plan.reuse_base](const auto& c) { return c.frontier == base; });
+            if (spec_index != spec.checkpoints.end() && !spec_index->image) {
+                // Cross-restart cold-restore spec: its checkpoint is a placeholder (no GDN image),
+                // so load the GDN endpoint image from the GDN store into a mutable copy before
+                // restoring. A normal in-memory archive already carries its checkpoint images and
+                // takes the direct path below (no copy, no disk read).
+                ArchivedPrefix archive = spec;
+                auto& checkpoint = archive.checkpoints[spec_index - spec.checkpoints.begin()];
+                std::vector<std::byte> gdn_image;
+                if (load_disk_gdn_endpoint(
+                        disk_gdn_endpoint_identity(archive.ledger.data(), archive.ledger.size()),
+                        gdn_image)) {
+                    auto image = std::shared_ptr<std::byte[]>(new std::byte[gdn_image.size()]);
+                    std::copy(gdn_image.begin(), gdn_image.end(), image.get());
+                    checkpoint.image = std::move(image);
+                    restore_archived_prefix(sequence, archive, request_plan, &disk_images);
+                } else {
+                    // The GDN endpoint was unavailable (missing, torn, CRC/identity mismatch): fall
+                    // back to a full recompute so the request still completes; the store dropped
+                    // only the failed slot, every other disk identity stays intact.
+                    ++disk_kv_restore_failures;
+                    request_plan.archived_prefix.reset();
+                    request_plan.reuse      = ReusePath::FullReset;
+                    request_plan.reuse_base = 0;
+                    request_plan.mtp_bridge = MtpBridgeMode::None;
+                    request_plan.prepare_mtp = speculative_backend_ == SpeculativeBackend::Mtp;
+                    if (prompt.identity.rewrite_checkpoint) {
+                        request_plan.rewrite_checkpoint_action  = RewriteCheckpointAction::CaptureNew;
+                        request_plan.rewrite_checkpoint_capture = *prompt.identity.rewrite_checkpoint;
+                    } else {
+                        request_plan.rewrite_checkpoint_action = RewriteCheckpointAction::Drop;
+                        request_plan.rewrite_checkpoint_capture.reset();
+                    }
+                    request_plan.summary.reusable_prompt_tokens = 0;
+                }
+            } else {
+                restore_archived_prefix(sequence, spec, request_plan, &disk_images);
+            }
         } else {
             // 3.4: a demoted chunk was unavailable (missing, torn, CRC/identity mismatch, or the
             // demotion write not yet complete). Fall back to a full recompute so the request
@@ -1637,6 +1694,7 @@ void ProgramImplCore::submit_disk_demotion(ArchivedPrefix& branch,
     }
     auto future = disk_demotion_pool->submit(
         [store = disk_kv_store.get(),
+         gdn_store = disk_gdn_store.get(),
          archive = std::make_shared<ArchivedPrefix>(branch), // strong ref: the branch is not
                                                              // dropped while in flight
          key = &branch, // canonical pointer: the in-flight/failed sets key on the history branch
@@ -1648,6 +1706,33 @@ void ProgramImplCore::submit_disk_demotion(ArchivedPrefix& branch,
                 if (store->write(chunk->disk_identity, payload)) { continue; }
                 ok = false;
                 break;
+            }
+            // Write the GDN state image at the branch's reusable (prompt) boundary into the
+            // separate GDN store under its re-derivable content identity, so a cross-restart cold
+            // restore can read it back. The boundary is the largest inner checkpoint (the prompt
+            // frontier), NOT the execution frontier: the execution frontier includes generated
+            // tokens that a re-issued prompt cannot re-derive, so keying the identity (and the
+            // GDN state) to the prompt boundary is what makes the restore numerically complete.
+            // Skipped when the GDN store is unavailable or the branch has no inner checkpoint
+            // (cold restore is then disabled, the KV tier is unaffected); a GDN write failure
+            // keeps the branch host-resident so a later trim retries it (consistent with a KV
+            // write failure).
+            if (ok && gdn_store != nullptr) {
+                const std::uint32_t reuse = self->disk_reuse_boundary(*archive);
+                if (reuse != 0) {
+                    const auto endpoint = std::find_if(archive->checkpoints.begin(),
+                        archive->checkpoints.end(),
+                        [reuse](const auto& c) { return c.frontier == reuse; });
+                    if (endpoint != archive->checkpoints.end() && endpoint->image) {
+                        const auto gdn_identity = self->disk_gdn_endpoint_identity(
+                            archive->ledger.data(), reuse);
+                        if (!gdn_store->write(gdn_identity,
+                                              std::span(endpoint->image.get(),
+                                                        self->prefix_checkpoint_bytes()))) {
+                            ok = false;
+                        }
+                    }
+                }
             }
             if (ok) {
                 // Release the host bytes under the demotion mutex: a restore guards the chunks it
@@ -1714,6 +1799,121 @@ bool ProgramImplCore::load_disk_restore_images(const ArchivedPrefix& archive, st
     return true;
 }
 
+// Cross-restart cold restore: re-derive the KV chunk identity chain from a re-issued token ledger
+// using the EXACT chunking and rolling digest of archive_prefix (pages = ceil(tokens/page_size),
+// chunks of kDiskKvChunkPages pages, digest advanced by each chunk's page-tail token count), then
+// walk the chunks from the start and stop at the first whose re-derived identity is absent from the
+// store. The result is the farthest recoverable page-tail frontier; a null store (disk tier off) or
+// a chain with no recoverable chunk records a match miss and yields 0. The re-derivation is a pure
+// function of the ledger, so it reproduces archive_prefix's identities chunk for chunk.
+std::uint32_t ProgramImplCore::disk_cold_recoverable_frontier(const TokenId* ledger,
+                                                              std::size_t n_tokens,
+                                                              std::uint64_t tag,
+                                                              const DiskKVStore* store) {
+    if (store == nullptr) { return 0; }
+    const auto frontier = disk_kv_cold_recoverable_frontier(
+        ledger, n_tokens, tag, static_cast<std::uint32_t>(kPagedKVPageSize), kDiskKvChunkPages,
+        [store](const DiskKVIdentity& id) { return store->contains(id); });
+    if (frontier == 0) { ++disk_kv_match_misses; }
+    return frontier;
+}
+
+// The reusable (prompt) boundary of an archived branch: the frontier of its largest inner
+// checkpoint (strictly below the branch's execution frontier). The disk-tier identity chain and
+// the GDN endpoint are keyed to this boundary (a pure function of the licensed prompt ledger),
+// not to the execution frontier, which includes generated tokens and so cannot be re-derived from
+// a re-issued prompt. A branch with no inner checkpoint returns 0 and is not cold-restorable.
+std::uint32_t ProgramImplCore::disk_reuse_boundary(const ArchivedPrefix& archive) const {
+    std::uint32_t boundary = 0;
+    for (const auto& checkpoint : archive.checkpoints) {
+        if (checkpoint.frontier != 0 && checkpoint.frontier < archive.frontier &&
+            checkpoint.frontier > boundary) {
+            boundary = checkpoint.frontier;
+        }
+    }
+    return boundary;
+}
+
+// The re-derivable content identity of the branch's GDN endpoint state image: the rolling digest
+// of the whole licensed ledger (ledger[0..n_tokens)) under the GDN payload-class tag, with the
+// page-tail frontier. This equals archive_prefix's final digest state (which absorbs exactly
+// ledger[0..frontier)), so the identity is identical before and after a process restart.
+DiskKVIdentity ProgramImplCore::disk_gdn_endpoint_identity(const TokenId* ledger,
+                                                           std::size_t n_tokens) const {
+    DiskKvPrefixDigest digest;
+    digest.absorb(ledger, n_tokens);
+    const std::uint32_t pages = prefix_page_count(static_cast<std::uint32_t>(n_tokens));
+    return DiskKVIdentity{digest.lo(), digest.hi(), disk_kv_gdn_tag, pages};
+}
+
+// Reads the GDN endpoint state image recorded under `identity` (exactly prefix_checkpoint_bytes()
+// bytes: every rank's linear-attention slot followed by rank 0's tail hidden) back from the
+// separate GDN store into `out`. Returns false when the GDN store is unavailable or the read
+// fails; the store drops only the failed slot while every other identity stays intact.
+bool ProgramImplCore::load_disk_gdn_endpoint(const DiskKVIdentity& identity,
+                                             std::vector<std::byte>& out) {
+    if (disk_gdn_store == nullptr) { return false; }
+    out.assign(prefix_checkpoint_bytes(), std::byte{});
+    return disk_gdn_store->read(identity, std::span(out));
+}
+
+// Cross-restart cold restore spec: a synthetic ArchivedPrefix whose chunks are re-derived from the
+// re-issued token ledger (the same chunking and rolling digest as archive_prefix, every chunk
+// marked demoted so the restore path reads its payload from the disk store) and whose single
+// checkpoint (at the full-prompt frontier) carries no GDN image yet (the execution path loads it
+// from the GDN store, keeping the disk read off the plan thread). Returns nullptr when the KV
+// chain is not fully recoverable to the full-prompt frontier or the GDN endpoint is absent, so the
+// caller falls back to a full recompute.
+std::shared_ptr<ArchivedPrefix>
+ProgramImplCore::build_disk_cold_restore_spec(const PreparedPromptData& prompt, const TokenId* ledger,
+                                              std::size_t n_tokens) {
+    if (n_tokens == 0 || disk_kv_store == nullptr) { return nullptr; }
+    const std::uint32_t pages = prefix_page_count(static_cast<std::uint32_t>(n_tokens));
+    // The KV chain must be fully recoverable to the full-prompt frontier (every chunk present in
+    // the KV store); otherwise the GDN endpoint (captured at that frontier) has no matching KV.
+    if (disk_cold_recoverable_frontier(ledger, n_tokens, disk_kv_tag, disk_kv_store.get()) != pages) {
+        return nullptr;
+    }
+    // The GDN endpoint image must be present in the GDN store (an in-memory index pre-check; the
+    // verified read happens in the execution path).
+    const auto gdn_identity = disk_gdn_endpoint_identity(ledger, n_tokens);
+    if (disk_gdn_store == nullptr || !disk_gdn_store->contains(gdn_identity)) { return nullptr; }
+
+    auto spec = std::make_shared<ArchivedPrefix>();
+    spec->frontier  = static_cast<std::uint32_t>(n_tokens);
+    // The MTP backend KV is valid up to the prompt minus the last token (the draft model's KV
+    // cache); non-MTP programs carry no backend KV.
+    spec->mtp_valid =
+        speculative_backend_ == SpeculativeBackend::Mtp ? static_cast<std::uint32_t>(n_tokens - 1) : 0;
+    spec->ledger.assign(ledger, ledger + n_tokens);
+    spec->identity.assign(prompt);
+    // A single placeholder checkpoint at the full-prompt frontier; the execution path loads the
+    // GDN endpoint image into it before restore_archived_prefix.
+    spec->checkpoints.push_back(PrefixCheckpoint{spec->frontier, nullptr});
+
+    // Re-derive the chunk descriptors exactly as archive_prefix does (chunking + rolling digest),
+    // so the re-derived identities match the archived chunks chunk for chunk.
+    const std::uint32_t backend_pages = prefix_page_count(spec->mtp_valid);
+    DiskKvPrefixDigest disk_digest;
+    std::size_t disk_absorbed = 0;
+    for (std::uint32_t first = 0; first < pages; first += kDiskKvChunkPages) {
+        const std::uint32_t count = std::min(kDiskKvChunkPages, pages - first);
+        const std::size_t tail_tokens = std::min<std::uint64_t>(
+            std::uint64_t(first + count) * kPagedKVPageSize, n_tokens);
+        disk_digest.absorb(ledger + disk_absorbed, tail_tokens - disk_absorbed);
+        disk_absorbed = tail_tokens;
+        auto chunk = std::make_shared<PrefixKVChunk>();
+        chunk->first_page    = first;
+        chunk->pages         = count;
+        chunk->backend_pages = first < backend_pages ? std::min(count, backend_pages - first) : 0;
+        chunk->disk_identity = DiskKVIdentity{disk_digest.lo(), disk_digest.hi(), disk_kv_tag,
+                                              first + count};
+        chunk->demoted.store(true, std::memory_order_relaxed); // payload lives in the disk store
+        spec->chunks.push_back(std::move(chunk));
+    }
+    return spec;
+}
+
 void ProgramImplCore::archive_prefix(SequenceState& sequence) {
     if (!sequence.archived_snapshot.expired()) { return; }
     const std::uint32_t frontier = sequence.execution_frontier;
@@ -1750,13 +1950,20 @@ void ProgramImplCore::archive_prefix(SequenceState& sequence) {
     // Rolling disk-tier content digest: a pure function of the licensed ledger prefix, advanced
     // by exactly the tokens each chunk's page-tail newly covers. Inherited chunks already carry a
     // valid identity (same prefix, computed when first archived), so the digest is still advanced
-    // for them to stay in sync with the fresh chunks that follow.
+    // for them to stay in sync with the fresh chunks that follow. The chain is keyed to the
+    // branch's reusable (prompt) boundary -- not the execution frontier, which includes generated
+    // tokens and so cannot be re-derived from a re-issued prompt -- so a cross-restart cold
+    // restore re-derives the identical identities from the prompt ledger. A branch with no inner
+    // checkpoint (boundary 0) keeps the full-ledger chain for the in-memory path.
     DiskKvPrefixDigest disk_digest;
     std::size_t disk_absorbed = 0;
+    const std::uint32_t reuse_boundary = disk_reuse_boundary(*archive);
+    const std::size_t digest_limit =
+        reuse_boundary != 0 ? reuse_boundary : archive->ledger.size();
     for (std::uint32_t first = 0; first < pages; first += chunk_pages) {
         const std::uint32_t count = std::min(chunk_pages, pages - first);
         const std::size_t tail_tokens = std::min<std::uint64_t>(
-            std::uint64_t(first + count) * kPagedKVPageSize, archive->ledger.size());
+            std::uint64_t(first + count) * kPagedKVPageSize, digest_limit);
         disk_digest.absorb(archive->ledger.data() + disk_absorbed, tail_tokens - disk_absorbed);
         disk_absorbed = tail_tokens;
         const auto inherited = std::find_if(sequence.prefix_chunks.begin(), sequence.prefix_chunks.end(),

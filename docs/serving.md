@@ -1018,8 +1018,12 @@ beneath it: when the host budget is exhausted, a demoted archived branch's KV ch
 disk asynchronously and its host bytes released; a later hit reads the demoted chunks back into
 private GPU pages, and a missing/corrupt slot falls back to a full recompute without dropping the
 other disk identities. Restarting with a changed `--disk-kv-gib` adopts the existing store
-(expand/shrink); a payload-class (slot size) mismatch is still rejected. See
-`docs/maintainer/paged-kv-cache.md` §21 for the demotion/restore
+(expand/shrink); a payload-class (slot size) mismatch is still rejected. Across a process restart the
+in-memory branch ledger is empty, so a re-issued session with no in-memory match re-derives its content
+identity from the re-issued token ledger and, when the disk tier is on, restores the demoted KV chunks and
+the persisted GDN endpoint state into private GPU pages from the on-disk store; a missing frontier, an
+absent GDN endpoint, or a failed read falls back to a full recompute without dropping the other identities.
+See `docs/maintainer/paged-kv-cache.md` §21 for the demotion/restore
 semantics, the disk-format-to-KV-format binding, and the LRU/capacity behavior.
 
 Active-lane state images have a 2 GiB per-Program budget divided among configured lanes;

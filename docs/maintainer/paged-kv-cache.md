@@ -1730,3 +1730,38 @@ host 层命中事件同时推进磁盘层最近使用戳（`touch_archived_prefi
 （`--disk-kv-gib`）独立封顶、写满后经 LRU 淘汰最旧未保护槽位。端到端恢复须与完整重算对照测量首 token
 延迟；恢复失败回退、进程重启索引重建、写满容量 LRU 边界的行为由 `src/core/disk_kv_store.{h,cpp}` 的
 独立单元测试覆盖，整模型 A/B 与重启测量在具备 GPU 与 `.ninfer` 产物的环境完成。
+
+### 21.8 跨重启冷恢复（内容寻址）
+
+进程重启后内存分枝台账（`prefix_history`）为空：重发的同一会话在匹配循环里没有内存命中。磁盘层启用时，
+plan 在"无内存命中"处对重发请求的 token 台账重推 `DiskKVIdentity` 链——与归档时**同一套** chunk 切分
+（pages = ceil(tokens/page_size)、按 `kDiskKvChunkPages` 切 chunk、按 page-tail 推进摘要）与
+`DiskKvPrefixDigest` 滚动摘要序列。`disk_cold_recoverable_frontier` 从页 0 起逐 chunk 用 `store->contains()`
+探测，停在首个缺失身份的 chunk，返回可恢复的最远页尾前沿；全缺失或台账为空时返回 0。不新增 on-disk
+格式，也不改 `DiskKVStore` 存储契约，故既有的 KV 目录几何不变。
+
+**身份链键控于分枝的可复用（prompt）边界**（`disk_reuse_boundary` = 最大内层检查点 frontier，即
+`save_prefix_checkpoint` 在 prompt 边界捕获的检查点），**而非执行前沿**：执行前沿含已生成 token，重发的
+prompt 台账无法重推其摘要，键控到执行前沿时末 chunk 摘要必失配、冷恢复退化整段重算。归档时
+`archive_prefix` 的滚动摘要只推进到该边界；无内层检查点的分枝（边界 0）保持全台账链供内存路径使用，
+但不冷可恢复。
+
+GDN（线性注意力）端点状态不在 KV chunk 中、也无法从 token 重推，故随降级一并持久化：`submit_disk_demotion`
+把可复用边界的检查点 image（`branch.checkpoints` 中 `frontier == disk_reuse_boundary` 的
+`PrefixCheckpoint.image`，`prefix_checkpoint_bytes()` 字节：各 rank 线性注意力递归状态 + rank 0 tail hidden）
+以独立身份 `DiskKVIdentity{lo, hi, disk_kv_gdn_tag, pages}` 写入 `dir/"gdn"` 子目录的独立内容寻址存储
+（`disk_kv_gdn_tag = disk_kv_tag ^ kDiskKvGdnStateTagXor`，`lo/hi` 为台账 `[0,边界)` 的滚动摘要，`pages =
+prefix_page_count(边界)`）。该身份同样可由重发台账重推，无需持久化分枝结构。KV chunk 与 GDN 端点分属两个
+几何（槽位尺寸）不同的存储，故 GDN 走独立子目录，避免与 KV 存储的槽位尺寸冲突（尺寸不符是打开时硬失败）。
+
+命中（前沿 > 0 且 GDN 端点 image 在库）时，plan 置 `reuse = RestorePrefixCheckpoint`、`reuse_base = 前沿`，
+经既有 `read()` + 页前缀导入路径把重推的 chunk 导入请求独占 GPU page；GDN 端点 image 经 `read()` 读回后经
+`restore_prefix_checkpoint` 写回各 rank GDN 槽位与 tail hidden——与 §21.3 的 host 常驻 chunk 走同一导入路径，
+仅数据来源替换为磁盘。物化对后续计算可见（流间有序，与既有恢复物化契约一致）。
+
+回退：KV 前沿为 0、GDN 端点缺失、或任一 `read()` 失败（缺页/撕裂/CRC/身份不符）时，请求回退到
+`ReusePath::FullReset` 完整重算并照常完成，绝不删除其他有效磁盘身份。该层仅在"无内存命中 + 磁盘层启用"
+时参与，门控在 `prefix_history` 匹配之后，不拖慢常见内存命中路径；前沿为 0 计入 `disk_kv_match_misses`。
+
+与容量收养（§21.2）交互：内容身份不依赖槽位容量，故改变 `--disk-kv-gib` 重开后同一台账仍重推同一身份链；
+缩容被剪枝的越界槽位对应身份自然缺失，`disk_cold_recoverable_frontier` 在其处截断，与收养的越界截断一致。

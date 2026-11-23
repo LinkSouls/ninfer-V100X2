@@ -496,6 +496,11 @@ public:
     //               a prefix-reuse match; the restore path (restore_archived_prefix, disk tier)
     //               reads a demoted chunk back by the same chunk->disk_identity.
     std::uint64_t disk_kv_tag = 0;
+    // GDN endpoint-state payload class: disk_kv_tag XOR kDiskKvGdnStateTagXor. The branch's
+    // endpoint checkpoint image (linear-attention recurrent state + tail hidden) is written into
+    // the same content-addressed store under this distinct tag, so it never aliases a KV chunk
+    // payload. It is a pure function of the program class, so it survives a process restart.
+    std::uint64_t disk_kv_gdn_tag = 0;
     std::uint64_t disk_kv_match_misses = 0;
     // Farthest page-tail frontier (in pages) at which every chunk from the start of `archive` up
     // to and including that frontier is present in `store` under the chunk's content identity. A
@@ -506,6 +511,12 @@ public:
     // Opened in the constructor from the plan's DiskKvTierConfig when enabled; null when the tier
     // is off (the default) or the open failed. Bound to the KV storage format at open.
     std::unique_ptr<DiskKVStore> disk_kv_store;
+    // Separate content-addressed store for the GDN endpoint state images, opened under
+    // `dir / "gdn"` with a slot sized to prefix_checkpoint_bytes(). It is distinct from
+    // disk_kv_store (whose slots are sized to a single KV chunk) so the KV store's geometry is
+    // unchanged and pre-existing KV directories stay openable. Null when the tier is off or the
+    // open failed; a missing GDN store simply disables cold restore (full recompute fallback).
+    std::unique_ptr<DiskKVStore> disk_gdn_store;
     // Per-page payload bytes of the text and backend (MTP) pools, fixed at construction; they size
     // the disk slots and the restore read buffers for a chunk's exact page count.
     std::size_t disk_kv_text_page_bytes = 0;
@@ -543,6 +554,40 @@ public:
     // read fails; the failed slot is dropped by the store while every other identity is kept.
     bool load_disk_restore_images(const ArchivedPrefix& archive, std::uint32_t base,
                                   std::vector<DiskChunkImage>& out);
+    // Cross-restart cold restore. Re-derives the KV chunk identity chain from a re-issued token
+    // ledger (the same chunking and rolling digest as archive_prefix) and returns the farthest
+    // page-tail frontier (in pages) at which every chunk is present in `store` under the
+    // re-derived identity. A null `store` (disk tier off) or a ledger with no recoverable chunk
+    // yields 0 and counts as a miss. `tag` is the program-level KV content-identity class (the
+    // caller passes disk_kv_tag).
+    std::uint32_t disk_cold_recoverable_frontier(const TokenId* ledger, std::size_t n_tokens,
+                                                 std::uint64_t tag, const DiskKVStore* store);
+    // The reusable (prompt) boundary of an archived branch: the frontier of its largest inner
+    // checkpoint (strictly below the branch's execution frontier). The disk-tier identity chain
+    // and the GDN endpoint are keyed to this boundary -- a pure function of the licensed prompt
+    // ledger -- not to the execution frontier, which includes generated tokens and is therefore
+    // not re-derivable from a re-issued prompt. Returns 0 when the branch has no inner
+    // checkpoint (it is then not cold-restorable; the KV chunks fall back to full-ledger
+    // identities for the in-memory path).
+    std::uint32_t disk_reuse_boundary(const ArchivedPrefix& archive) const;
+    // The re-derivable content identity of a branch's GDN endpoint state image (the checkpoint at
+    // `n_tokens`): the rolling digest of ledger[0..n_tokens) under the GDN tag, with the page-tail
+    // frontier. `n_tokens` is the reusable boundary (disk_reuse_boundary). A pure function of the
+    // token ledger; no branch structure is persisted, so the identity is the same before and after
+    // a process restart.
+    DiskKVIdentity disk_gdn_endpoint_identity(const TokenId* ledger, std::size_t n_tokens) const;
+    // Reads the GDN endpoint state image recorded under `identity` (prefix_checkpoint_bytes()
+    // bytes) into `out`. Returns false when the read fails; the store drops only the failed slot.
+    bool load_disk_gdn_endpoint(const DiskKVIdentity& identity, std::vector<std::byte>& out);
+    // Cross-restart cold restore spec: a synthetic ArchivedPrefix whose chunks are re-derived from
+    // the re-issued token ledger (the same chunking/digest as archive_prefix, all marked demoted so
+    // the restore path reads them from the disk store) and whose single checkpoint (at `n_tokens`)
+    // carries no GDN image yet (the execution path loads it from the GDN store). Returns nullptr
+    // when the KV chain is not fully recoverable to the full-prompt frontier or the GDN endpoint
+    // is absent, so the caller falls back to a full recompute.
+    std::shared_ptr<ArchivedPrefix>
+    build_disk_cold_restore_spec(const PreparedPromptData& prompt, const TokenId* ledger,
+                                 std::size_t n_tokens);
 
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;

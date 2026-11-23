@@ -279,6 +279,21 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 }
             }
         }
+        // Cross-restart cold restore: when no in-memory branch matched and the disk tier is
+        // enabled, re-derive the content-identity chain from the re-issued prompt's token ledger
+        // and restore from the disk stores (KV chunks + GDN endpoint). It only participates on a
+        // memory miss, so the common memory-hit path is untouched. build_disk_cold_restore_spec
+        // returns nullptr (full recompute fallback) when the KV chain is not fully recoverable to
+        // the full-prompt frontier or the GDN endpoint is absent.
+        if (plan->archived_prefix == nullptr && disk_kv_store != nullptr &&
+            !prompt.token_ids.empty()) {
+            plan->archived_prefix = build_disk_cold_restore_spec(
+                prompt, prompt.token_ids.data(), prompt.token_ids.size());
+            if (plan->archived_prefix != nullptr) {
+                plan->reuse      = ReusePath::RestorePrefixCheckpoint;
+                plan->reuse_base = static_cast<std::uint32_t>(prompt.token_ids.size());
+            }
+        }
     }
 
     // Resident-lane reuse (AppendAtFrontier or a lane prefix checkpoint) shadows archived branches
