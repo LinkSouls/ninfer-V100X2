@@ -464,20 +464,46 @@ DiskKVStore::open(const std::filesystem::path& dir, std::uint32_t kv_format,
                         ", engine requires " + format_name(kv_format) +
                         "; remove the store directory or match the KV format");
         }
-        if (meta.slot_size != slot_size || meta.slot_count != slot_count) {
-            return fail("disk KV geometry mismatch: store records " +
-                        std::to_string(meta.slot_size) + " x " + std::to_string(meta.slot_count) +
-                        ", this open requires " + std::to_string(slot_size) + " x " +
-                        std::to_string(slot_count));
+        // slot_size is the payload class (a function of KV format and max payload); a different
+        // size means the data cannot be mixed, so it stays a hard fail. slot_count is pure
+        // capacity and is adopted below (resize + meta rewrite), never an error.
+        if (meta.slot_size != slot_size) {
+            return fail("disk KV slot size mismatch: store records " +
+                        std::to_string(meta.slot_size) + ", this open requires " +
+                        std::to_string(slot_size) +
+                        "; remove the store directory or match the payload class");
         }
+        const bool adopt_capacity = meta.slot_count != slot_count;
         impl->data_fd = ::open(impl->data_path.c_str(), O_RDWR);
         if (impl->data_fd < 0) { return fail("cannot open disk KV data file: " + impl->data_path); }
-        struct stat st;
-        if (::fstat(impl->data_fd, &st) != 0 ||
-            static_cast<std::size_t>(st.st_size) != impl->capacity_bytes) {
-            ::close(impl->data_fd);
-            impl->data_fd = -1;
-            return fail("disk KV data file size does not match the recorded geometry");
+        if (adopt_capacity) {
+            // Capacity changed since the store was written: adopt it. Expanding sparse-extends the
+            // data file (the new region reads as zero => empty slot headers); shrinking truncates
+            // it. Both cases persist the new slot_count. The index below then reconciles: a
+            // shrunken index is rejected by parse_index (entry_count > slot_count, or a slot >=
+            // slot_count) and rebuilt by the existing slow path, which prunes out-of-bounds entries
+            // and persists the result atomically; an expanded index is adopted on the fast path and
+            // the new empty slots enter the free set. No new index-side code is needed.
+            if (::ftruncate(impl->data_fd, static_cast<off_t>(impl->capacity_bytes)) != 0) {
+                ::close(impl->data_fd);
+                impl->data_fd = -1;
+                return fail("cannot resize disk KV data file to the requested capacity");
+            }
+            if (!write_meta(impl->meta_path, kv_format, slot_size, slot_count)) {
+                ::close(impl->data_fd);
+                impl->data_fd = -1;
+                return fail("cannot rewrite disk KV meta file");
+            }
+        } else {
+            // Same capacity: keep the strict size check (the p5 corruption-detection contract is
+            // unchanged); the size was not just established by ftruncate.
+            struct stat st;
+            if (::fstat(impl->data_fd, &st) != 0 ||
+                static_cast<std::size_t>(st.st_size) != impl->capacity_bytes) {
+                ::close(impl->data_fd);
+                impl->data_fd = -1;
+                return fail("disk KV data file size does not match the recorded geometry");
+            }
         }
     } else {
         impl->data_fd = ::open(impl->data_path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);

@@ -1652,8 +1652,9 @@ prefill、缓存命中、质量和整进程内存分别报告；外部 llama.cpp
 
 历史 KV 的默认两级是 **device**（GPU 独占 page）与 **host**（`--prefix-cache-tokens` 预算下的归档分枝，
 见 §10.4）。`EngineOptions.disk_kv_dir` 非空且 `disk_kv_capacity_gib>0` 时启用**磁盘第三层**，
-构成 device → host → disk 的三级层次，默认关闭：目录为空或容量为 0 时不创建任何文件、不发生任何
-降级，行为与关闭前逐字节一致。启用后，当 host 预算耗尽、`trim_prefix_history()` 选中让位分枝时，
+构成 device → host → disk 的三级层次。默认 64 GiB：仅给 `--disk-kv-dir` 即以 64 GiB 容量启用；
+`--disk-kv-gib 0` 是显式关闭（不创建任何文件、不发生任何降级）；未指定目录时磁盘层完全关闭，
+行为与关闭前逐字节一致。启用后，当 host 预算耗尽、`trim_prefix_history()` 选中让位分枝时，
 不再直接丢弃，而是把该分枝的独占、尚未降级的 chunk 异步写入 NVMe 存储；写入成功后释放其 host 字节
 并记录磁盘身份，分枝仍留在历史集合中、可被再次匹配，从而避免第二轮请求的完整重算。
 
@@ -1675,6 +1676,16 @@ chunk 页尾位置。同一身份携带同一 payload 字节，因此槽位仅�
 或完整新版索引，绝不看到半写。存储在打开时记录其 KV 存储格式标识（引擎传入 `KvCacheStorage` 原始值）；
 与当前引擎格式不一致时在打开时拒绝使用该存储文件并给出明确原因（format mismatch），绝不复用异格式存储。
 淘汰是 page 粒度 LRU，按最近使用戳经有序索引 O(log n) 定位最旧未保护槽位。
+
+**容量可变与重启自适应收养**：槽位容量（`slot_count`）不是建库时的不变量。打开既有存储时若请求容量
+与 meta 记录不同，则收养该存储：数据文件经 `ftruncate` 扩容（稀疏扩展，新区域读为零即空槽位头）
+或缩容（截断），并重写 meta 的 `slot_count`。缩容时槽位号超出新容量的索引条目被丢弃——截断后旧索引
+的结构校验自然失败，落入既有的"扫描槽位头重建索引"慢路径，越界条目被剪枝并原子持久化，索引侧零新代码。
+扩容时既有有效条目保持可恢复，新增空槽位进入 LRU 空闲集；同容量重开为无操作（保留严格尺寸检查的
+损坏检测契约）。两个崩溃窗口均自愈：`ftruncate` 后、meta 重写前进程死亡，则下次打开重放同一调整
+（幂等）；meta 重写后、缩容索引持久化前进程死亡，则越界索引条目在下次打开被拒绝并重建。
+槽位尺寸（载荷类别）或 KV 格式族不一致仍是硬失败，不混用不同载荷类别的数据；
+回滚旧二进制后需以匹配新 meta 的 `--disk-kv-gib` 打开（可恢复，非数据丢失）。
 
 ### 21.3 恢复语义
 
@@ -1705,7 +1716,8 @@ plan/serve 路径从不阻塞在磁盘 I/O 上。plan 线程是唯一提交者�
 
 ### 21.6 选项与可观测性
 
-CLI/serve 提供 `--disk-kv-dir DIR` 与 `--disk-kv-gib N`（默认关闭）。启动 JSON 记录
+CLI/serve 提供 `--disk-kv-dir DIR` 与 `--disk-kv-gib N`（默认 64 GiB；`--disk-kv-gib 0` 显式关闭，
+无目录时完全关闭）。启动 JSON 记录
 `disk_kv_dir`/`disk_kv_capacity_gib`/`disk_kv_enabled`。运行时查询接口 `Engine::disk_tier_stats()`
 返回占用（capacity/used/active pages）与累计事件计数（写/读/失败/CRC/身份/淘汰/索引重建/恢复回退）。
 host 层命中事件同时推进磁盘层最近使用戳（`touch_archived_prefix` 对每个已降级 chunk 调
