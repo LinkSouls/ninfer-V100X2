@@ -57,10 +57,12 @@ void require_supported_tp_features(const EngineOptions& options) {
     // the draft head is vocabulary-split with an allgather before the proposal argmax, and the GDN
     // verify round records and folds per device. DFlash has a separate split-aware proposal path;
     // its rank-0-only selector gather is deliberately not a full bidirectional all-gather.
-    // Vision encodes on the primary rank and replicates the composed residual to the peer
-    // (see TextContext::prefill_impl_tp2); the TP4 route does not carry Vision.
-    if (options.tp == 4 && options.enable_vision) {
-        throw std::invalid_argument("--tp 4 does not support Vision");
+    // Vision encodes on the primary rank and replicates the composed residual to the peers
+    // (see TextContext::prefill_impl_tp2). The TP4 route carries a GPU-resident tower; the CPU
+    // tower (--vision-device cpu) is not admitted on TP4.
+    if (options.tp == 4 && options.enable_vision && options.vision_device == VisionDevice::Cpu) {
+        throw std::invalid_argument("--tp 4 Vision requires a GPU-resident tower "
+                                    "(--vision-device cpu is not admitted on TP4)");
     }
     if (options.tp == 4 && options.speculative.backend == SpeculativeBackend::DFlash) {
         throw std::invalid_argument("--tp 4 supports Text/MTP, not DFlash");

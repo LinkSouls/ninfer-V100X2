@@ -356,7 +356,8 @@ the headline decode metric. This is one group, with no new quality evaluation.
 
 This release adds Vision to the default-off long-attention profile and optionally moves the
 visual tower to CPU RAM. It does not introduce a new text decode kernel or claim another
-pure-text speedup over v0.1.1. Fast decode remains incompatible with Vision. QUASAR TP4
+pure-text speedup over v0.1.1. Fast decode is combinable with Vision (admitted in a later
+change; this v0.1.2 release predates it). QUASAR TP4
 qualification and measurements ship in v0.2.0; see [TP4](tp4.md).
 
 The qualification below uses the same local two V100s, driver 580.178.04, CUDA 12.8, QUASAR v3,

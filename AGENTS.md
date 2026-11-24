@@ -116,9 +116,11 @@ measurements of this target. The supported identities are
 `qwen3.8-27b/nvfp4`, `qwen3.8-27b/fp8`, `qwen3.8-27b/gguf-q4-k-m`, and
 `qwen3.6-35b-a3b/groupwise-int`.
 The explicitly requested QUASAR trial adds `qwen3.8-27b/quasar-nvfp4`, currently restricted to
-SM70 TP2 Text/None/MTP/DFlash, TP2 image/video Vision with None/MTP, experimental TP4
-Text/None/MTP, and experimental PP2 Text/None/MTP. Vision excludes DFlash, PP2 and the fast-decode numerical profile. Vision admits the default-off
-long-attention profile on TP2 with complete INT8 group-64 KV. It registers the published QUASAR v3 container identity, preserves its
+SM70 TP2 Text/None/MTP/DFlash, TP2/TP4 image/video Vision (GPU-resident tower) with None/MTP,
+experimental TP4 Text/None/MTP, and experimental PP2 Text/None/MTP. Vision excludes DFlash, PP2
+and the CPU tower (`--vision-device cpu`); it is combinable with the fast-decode numerical
+profile. Vision admits the default-off long-attention profile on TP2 with complete INT8 group-64
+KV (TP4 Vision keeps the ordinary attention profile, long-attention×Vision stays TP2-only). It registers the published QUASAR v3 container identity, preserves its
 256 NVFP4 parents and FP32 activation divisors, and keeps its W8 vocabulary/MTP and BF16 GDN
 controls and optional W8/BF16 DFlash2 package. The 27B draft window remains at most seven.
 This artifact's QAT/conversion quality is not established by inference smoke tests.
@@ -137,7 +139,8 @@ single-request TP4 Text/MTP on Qwen3.8-27B official NVFP4, QUASAR NVFP4 and nati
 FP8. QUASAR TP4 admits the default-off long-attention and fast-decode profiles; its four-card
 qualification and measurements are recorded separately from official NVFP4/native FP8. Native FP8 preserves
 source E4M3 codes and BF16 block multipliers without requantization and requires TP4 on SM70.
-TP4 Vision/DFlash and other TP4 identities are not admitted. Operator checks on the local two
+TP4 DFlash and other TP4 identities are not admitted; TP4 Vision (GPU-resident tower on the
+primary rank) is admitted, pending four-card qualification. Operator checks on the local two
 cards do not substitute for four-card whole-model/state or end-to-end performance evidence.
 Release 0.2.1 additionally qualifies QUASAR TP4 Text/MTP4 with one to eight active requests.
 Packed batch projections and 640 KiB device packet channels cover up to 64 columns; fused
@@ -193,7 +196,7 @@ Release 0.1.2 contains these Vision changes and an optional qualified Linux SM70
 QUASAR TP4 qualification is recorded separately and ships in release 0.2.0.
 
 The optional `volta_fast_decode` profile is default-off and admits QUASAR SM70 TP2/TP4
-Text/None/MTP. It selects packed NVFP4 parents with FP32 scale-after-K-reduction and
+None/MTP (combinable with Vision; DFlash is not). It selects packed NVFP4 parents with FP32 scale-after-K-reduction and
 shape-specific packed MTP W8 reductions. The normal profile retains per-group FP16 scaling
 with the same exact weight layout, fusion and communication optimizations. Both paths keep
 original codes/scales/divisors and one resident copy. The fast profile can change logits and

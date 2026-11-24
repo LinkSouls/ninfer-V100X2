@@ -4,6 +4,69 @@ The four-card results below belong to a separate NVLink host. Local V100X2 contr
 explicitly. QUASAR and the older official NVFP4/native FP8 measurements use different artifacts
 and draft windows; keep their results separate.
 
+## QUASAR TP4 Vision (GPU tower): four-card admission qualification (2026-11-24)
+
+TP4 + Vision (GPU-resident tower on the primary rank) and its combination with the fast-decode
+profile are now admitted (see the [contract](../../AGENTS.md)); this section records the
+four-card admission qualification. Host: the separate four-card NVLink V100-SXM2 16 GB host,
+QUASAR v3 NVFP4 artifact, INT8 group-64 KV, 32768-token context, one request. This is an
+admission and state check, not a performance measurement; no tok/s is claimed here.
+
+| Cell | Command | Result |
+|---|---|---|
+| TP4 + Vision | `--tp 4 --devices 0,1,2,3 --vision` | startup OK (load + 3051-node graph capture + KV/GDN state) |
+| TP4 + Vision + fast decode | `--tp 4 --vision --volta-fast-decode` | startup OK |
+| TP4 + Vision + MTP4 | `--tp 4 --vision --spec mtp --draft-tokens 4` | startup OK |
+| TP4 + CPU tower (negative) | `--tp 4 --vision --vision-device cpu` | rejected at startup: `--tp 4 Vision requires a GPU-resident tower (--vision-device cpu is not admitted on TP4)` |
+| TP4 + DFlash (negative, inherited) | `--tp 4 --spec dflash --draft-tokens 4` | rejected: `--tp 4 supports Text/MTP, not DFlash` |
+| TP4 + long attention + Vision (negative, inherited) | `--tp 4 --vision --volta-long-attention` | rejected: `Volta long attention requires SM70 27B TP2/TP4 Text/None/MTP (Vision on TP2 only) ...` |
+
+Tower residency: with Vision enabled, rank 0 held 9228 MiB versus 8626 MiB on ranks 1–3
+(~602 MiB delta = the ~282 MiB packed tower plus the Vision encode workspace), confirming the
+tower materializes on the primary rank only. The MTP cell held 9372/8768 MiB (extra MTP KV).
+
+Separate evidence layers, kept distinct:
+
+- **Local two-card (operand-level)**: T0 gate-matrix assertions, T2 text-only bit equivalence
+  (change vs. pre-change, token-for-token), and TP2 `--vision --volta-fast-decode` startup
+  admission with the PP2/long-attention/DFlash negative boundaries held.
+- **Four-card (this section)**: the three TP4 Vision cells boot, capture graphs and allocate
+  state; the CPU-tower negative boundary rejects with the cell-naming message.
+
+Image end-to-end: a whole-image request returns HTTP 200 with a coherent caption
+(`prompt_tokens` includes the visual tokens, request log records `request_done`). This host's
+bundled FFmpeg 7.x build registers 472 decoders **without a PNG decoder** (`avcodec_find_decoder(PNG)`
+is NULL) but **with a WebP decoder**, so the image fixture must be WebP; a PNG fixture returns
+400 `invalid_media` ("media codec is not supported"), which is reproduced identically on the
+**pre-change** binary with the plain `--vision` TP2 combination, confirming it is an environment
+(fixture-format) limitation, not an effect of this change (the change does not touch the
+media-decode path). No `apt`/system-FFmpeg install is needed or appropriate: the server links
+the deps-prefix `libavcodec.so.60` (FFmpeg 7), which the distro's FFmpeg 4 (`libavcodec58`)
+cannot satisfy.
+
+**MTP-fixture ID / speculative-counter gate (task 4.1, last sub-item).** On the same host, the
+post-change test binary ran the TP4 / MTP4 / Full-head MTP fixture gate against the host artifact
+`swift15-nvfp4full-dflash2` (INT8 group-64 KV; the same artifact the cells above use — the section's
+"QUASAR v3 NVFP4" label refers to this host's registered NVFP4 artifact). The fixture-internal
+preservation criterion the MTP cell requires passed:
+
+- **Graph/eager parity PASS** — the committed output IDs and every speculative counter
+  (`rounds`, `drafted`, `accepted`, `fallback_steps`, `accepted_per_position`) were identical between
+  the graph and eager engines: probe 0 accepted `24/28`, probe 1 accepted `23/31` in both.
+- **Teacher-forced argmax** — 0 disagreements over 64 positions
+  (`worst_emitted_logit_deficit=0`, the NVFP4 strict criterion); `speculative_vs_plain_sequence_equal=1`
+  for both probes.
+
+This confirms the vision-tower placement change is a no-op for the text-only MTP route: the changed
+branches are vision-gated and do not execute when Vision is off, so the MTP fixture is invariant to it.
+
+**Out-of-scope observation (recorded, not a defect of this change).** The test binary's additional
+C2/C4/C8 concurrent-decode batch probe (`exercise_mtp_batches`, the v0.2.1 feature) reported
+"did not reach its full batch" at C2 on this host, consistently across 3 runs. That probe exercises
+the concurrent-decode scheduler and is independent of the vision-tower placement (which is
+`ValidateOnly` when Vision is off, an identical load plan to the pre-change binary); it does not gate
+the vision-admission cell and is not claimed to pass here.
+
 ## v0.2.1: QUASAR concurrent decode
 
 QUASAR TP4 Text/MTP4 now has qualified C2/C4/C8 batched projections, packet/norm handoff,
@@ -29,7 +92,8 @@ For the benchmark's bounded concurrency configuration:
 requests require queueing at this capacity. Increase `--kv-capacity` only within available
 VRAM; `--kv-capacity auto` resolves capacity at startup. Cold long prefills also stagger
 decode readiness even when there is enough KV. Both numerical flags remain default-off;
-this command opts in and can change generated outputs. TP4 Vision/DFlash remain unsupported.
+this command opts in and can change generated outputs. TP4 DFlash remains unsupported; TP4
+Vision (GPU-resident tower on the primary rank) is admitted, pending four-card qualification.
 
 ### 1Cat 1.5.2: complete-code MTP4 comparison (2026-11-08)
 
@@ -778,7 +842,9 @@ output head and MTP stem remain BF16. The result is 31.30 GB (decimal). Its iden
 See the [native artifact contract](maintainer/qwen3.8-27b-artifact.md#native-block-128-fp8-textmtp-package).
 
 The selected TP4 domain is Qwen3.8-27B official NVFP4, QUASAR NVFP4 and native FP8 Text/MTP
-on SM70. Native FP8 requires TP4; all three TP4 routes exclude Vision and DFlash. The older
+on SM70. Native FP8 requires TP4; all three TP4 routes exclude DFlash. The QUASAR TP4 route
+additionally admits Vision (GPU-resident tower on the primary rank), pending four-card
+qualification; the official NVFP4 and native FP8 TP4 routes remain text-only. The older
 official NVFP4/native FP8 graph/eager, MTP commit, prefix-cache, HTTP and occupancy/capacity
 measurements in this section were obtained on the separate four-card host.
 The existing TP2 and 1Cat tables above are not relabeled as TP4 measurements.

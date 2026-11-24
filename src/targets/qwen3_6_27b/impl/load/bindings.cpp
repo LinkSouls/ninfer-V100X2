@@ -951,12 +951,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     if (quasar && (tp != 2 && tp != 4 && pp != 2)) {
         throw std::invalid_argument("QUASAR requires TP2, text-only TP4 or text-only PP2 (DFlash is TP2 only)");
     }
-    if (tp == 4 && features.vision) {
-        throw std::invalid_argument("qwen3_6_27b: TP4 does not support Vision");
+    if (tp == 4 && features.vision && features.vision_device == VisionDevice::Cpu) {
+        throw std::invalid_argument("qwen3_6_27b: TP4 Vision requires a GPU-resident tower "
+                                    "(--vision-device cpu is not admitted on TP4)");
     }
     if (features.volta_fast_decode && (!quasar || (tp != 2 && tp != 4) || pp != 1 ||
-                                       features.vision || features.dflash())) {
-        throw std::invalid_argument("volta_fast_decode requires QUASAR SM70 TP2/TP4 Text/None/MTP");
+                                       features.dflash())) {
+        throw std::invalid_argument("volta_fast_decode requires QUASAR SM70 TP2/TP4 None/MTP "
+                                    "(Vision is combinable; DFlash is not)");
     }
     if (native_fp8 && (tp != 4 || features.vision || features.dflash())) {
         throw std::invalid_argument("qwen3.8-27b/fp8 supports TP4 Text/MTP only");
@@ -1138,10 +1140,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
             bind_dflash("dflash/candidate_selector/successor_codebook", {248320, 256});
     }
 
+    // The Vision tower is the one component the ShardPlan never splits: it is a whole, unsharded
+    // sub-model. On the GPU it materializes on the primary rank (device 0) only, for every TP
+    // width -- TP2 and the newly-admitted TP4 both use PrimaryDevice so ranks 1..N-1 hold no copy.
+    // (The old tp>2 Device branch would route the tower through the shard resolver, which rejects
+    // every vision/* object with "unrecognized object family".)
     const artifact::TensorPlacement vision_placement =
         features.vision ? (features.vision_device == VisionDevice::Cpu ? artifact::TensorPlacement::Host
-                                 : tp == 2 ? artifact::TensorPlacement::PrimaryDevice
-                                   : artifact::TensorPlacement::Device)
+                                 : artifact::TensorPlacement::PrimaryDevice)
                         : artifact::TensorPlacement::ValidateOnly;
     if (ggml_k) {
         binder.validate_unconsumed_matching("vision/gguf/");
