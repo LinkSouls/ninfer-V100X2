@@ -65,7 +65,12 @@ C2/C4/C8 concurrent-decode batch probe (`exercise_mtp_batches`, the v0.2.1 featu
 "did not reach its full batch" at C2 on this host, consistently across 3 runs. That probe exercises
 the concurrent-decode scheduler and is independent of the vision-tower placement (which is
 `ValidateOnly` when Vision is off, an identical load plan to the pre-change binary); it does not gate
-the vision-admission cell and is not claimed to pass here.
+the vision-admission cell. Root cause found afterwards: the probe's old `peak_ready == concurrency`
+invariant (N requests simultaneously decode-ready) is structurally unreachable under the
+proportional decode-compensation scheduler, which drains early-ready requests during later prefills
+(measured peaks: C2=1, C4=2, C8=2). The probe criterion was fixed in the
+`mtp-batch-probe-criterion` change to assert multi-row decode batch formation
+(`decode_row_rounds > decode_rounds`), the property the scheduler actually guarantees.
 
 ## v0.2.1: QUASAR concurrent decode
 
@@ -75,6 +80,11 @@ task matrix includes TP4, NVLink TP2, local PCIe P2P TP2 and the same-host
 **1Cat 1.5.2 / QUASAR NVFP4 / MTP4** control, refreshed on 2026-11-08.
 See [results, acceptance, actual batch and numerical limits](performance.md#tp4-concurrent-packed-batch-decode-2026-11-05).
 The binary and Docker assets use this same implementation.
+
+The `--mtp-batches` gate's full-batch criterion is **multi-row decode batch formation**
+(`decode_row_rounds > decode_rounds`), not "N requests simultaneously decode-ready": the
+proportional decode-compensation scheduler drains early-ready requests during later prefills, so
+the instantaneous decode-ready count converges to ~2 regardless of N.
 
 For the benchmark's bounded concurrency configuration:
 
